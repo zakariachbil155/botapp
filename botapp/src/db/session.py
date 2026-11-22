@@ -17,7 +17,7 @@ def _normalize(url: str) -> str:
 
 
 DATABASE_URL = _normalize(
-    os.getenv("DATABASE_URL", "postgresql+psycopg://postgres:postgres@127.0.0.1:5432/app_db")
+    os.getenv("DATABASE_URL") or "postgresql+psycopg://postgres:postgres@127.0.0.1:5432/app_db"
 )
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
