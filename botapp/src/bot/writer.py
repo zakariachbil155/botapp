@@ -5,7 +5,9 @@ from groq import AsyncGroq
 from src.bot.feeds import Entry
 
 # حد تعليق الصورة في تيليغرام 1024 حرفاً. نبقى تحته لأن سطر المصدر يُضاف بعد الصياغة.
-MAX_CHARS = 600
+MAX_CHARS = 450
+SUMMARY_MAX = 200  # أقصى طول للملخص بالحروف
+SUMMARY_SENTENCES = 2
 MAX_TAGS = 4
 
 # الموجّه هو ما يجعل الناتج صحافة رياضية عربية لا ترجمة حرفية. عدّله بحرية.
@@ -16,7 +18,7 @@ SYSTEM_PROMPT = """أنت محرر رياضي في صحيفة عربية كبر�
 
 [إيموجي] عنوان قصير جذاب في سطر واحد
 
-فقرة ملخص من جملتين إلى ثلاث جمل قصيرة بالفصحى المبسّطة، تذكر الحدث وأهم ما فيه فقط.
+فقرة ملخص من جملة واحدة إلى جملتين قصيرتين جداً (أقل من 200 حرف) بالفصحى المبسّطة، تذكر الحدث وأهم ما فيه فقط.
 
 📌 التفاصيل:
 • معلومة محددة من النص (رقم، اسم، تاريخ، تصريح)
@@ -45,7 +47,7 @@ SYSTEM_PROMPT = """أنت محرر رياضي في صحيفة عربية كبر�
 - لا تخترع أي معلومة أو رقم أو تصريح غير موجود في النص.
 - لا تحوّل الإشاعة إلى خبر مؤكد، واستخدم «بحسب تقارير» عند الحاجة.
 - لا تضف رابطاً ولا مصدراً ولا تعليقات شخصية، ولا مبالغات ولا عناوين مضللة.
-- الطول الكلي متوسط: بين 350 و500 حرف، ولا تكرر في التفاصيل ما قلته في الملخص.
+- الطول الكلي متوسط: بين 250 و400 حرف، ولا تكرر في التفاصيل ما قلته في الملخص.
 """
 
 _URL = re.compile(r"https?://\S+")
@@ -73,6 +75,34 @@ def _drop_details(body: str) -> str:
     return body[:idx].rstrip() if idx != -1 else body
 
 
+_SENT = re.compile(r"(?<=[.!؟?])\s+")
+
+
+def _shorten_summary(summary: str) -> str:
+    """يبقي أول جملتين فقط، وجملة واحدة إن زاد الطول عن الحد."""
+    sentences = [x.strip() for x in _SENT.split(summary.strip()) if x.strip()]
+    if not sentences:
+        return summary.strip()
+    out = " ".join(sentences[:SUMMARY_SENTENCES])
+    if len(out) > SUMMARY_MAX and len(sentences) > 1:
+        out = sentences[0]
+    if len(out) > SUMMARY_MAX:
+        cut = out[:SUMMARY_MAX]
+        end = max(cut.rfind("،"), cut.rfind(" "))
+        out = cut[:end].rstrip("،, ") + "…"
+    return out
+
+
+def _tighten_body(body: str) -> str:
+    """يقصّ كتلة الملخص (بين العنوان وقسم التفاصيل) دون المساس بغيرها."""
+    idx = body.find("📌")
+    head, rest = (body[:idx].rstrip(), body[idx:]) if idx != -1 else (body, "")
+    parts = head.split("\n\n", 1)
+    if len(parts) == 2:
+        head = parts[0] + "\n\n" + _shorten_summary(parts[1])
+    return head + ("\n\n" + rest if rest else "")
+
+
 def _clean(text: str) -> str:
     text = text.replace("**", "").replace("__", "")
     text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)  # عناوين markdown لا وسوم
@@ -80,6 +110,7 @@ def _clean(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
 
     body, tags = _split_tags(text)
+    body = _tighten_body(body)
     tag_line = " ".join(tags)
 
     def total(b: str) -> int:
