@@ -1,5 +1,6 @@
 import html
 import logging
+from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
@@ -12,7 +13,7 @@ from telegram.ext import (
     filters,
 )
 
-from src.bot import football
+from src.bot import fixtures, football
 from src.bot.config import Settings, load_settings
 from src.bot.feeds import INJURY_WORDS, TRANSFER_WORDS, fetch_entries
 from src.bot.jobs import post_news
@@ -94,6 +95,23 @@ async def transfers(update: Update, ctx: Ctx) -> None:
     await _rss_command(update, ctx, "transfers")
 
 
+async def today(update: Update, ctx: Ctx) -> None:
+    """مباريات اليوم عند الطلب (نفس قائمة منشور 10:30)."""
+    now = datetime.now(fixtures.TZ)
+    try:
+        matches = await fixtures.fetch_matches(now, _settings(ctx).football_token)
+    except Exception:
+        log.exception("fixtures request failed")
+        await _reply(update, "تعذّر جلب المباريات الآن، حاول بعد قليل.")
+        return
+    messages = fixtures.build_messages(matches, now)
+    if not messages:
+        await _reply(update, "لا توجد مباريات مهمة اليوم.")
+        return
+    for text in messages:
+        await _reply(update, text)
+
+
 async def start(update: Update, _ctx: Ctx) -> None:
     await _reply(
         update,
@@ -101,7 +119,8 @@ async def start(update: Update, _ctx: Ctx) -> None:
         "/نتائج [الدوري] — آخر النتائج\n"
         "/ترتيب [الدوري] — جدول الترتيب\n"
         "/إصابات — أخبار الإصابات\n"
-        "/انتقالات — أخبار الانتقالات\n\n"
+        "/انتقالات — أخبار الانتقالات\n"
+        "/مباريات — مباريات اليوم\n\n"
         "الدوريات: PL, PD, SA, BL1, FL1",
     )
 
@@ -114,6 +133,8 @@ ARABIC_ROUTES = {
     "إصابات": injuries,
     "اصابات": injuries,
     "انتقالات": transfers,
+    "مباريات": today,
+    "اليوم": today,
 }
 
 
@@ -139,6 +160,18 @@ async def _post_init(app: Application) -> None:  # type: ignore[type-arg]
         args=[app.bot, settings, writer],
         max_instances=1,
     )
+    # منشور مباريات اليوم كل صباح 10:30 بتوقيت المغرب
+    scheduler.add_job(
+        fixtures.post_todays_fixtures,
+        "cron",
+        hour=10,
+        minute=30,
+        timezone=fixtures.TZ,
+        args=[app.bot, settings],
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
     scheduler.start()
     app.bot_data["scheduler"] = scheduler
 
@@ -156,6 +189,7 @@ def main() -> None:
     app.add_handler(CommandHandler("table", table))
     app.add_handler(CommandHandler("injuries", injuries))
     app.add_handler(CommandHandler("transfers", transfers))
+    app.add_handler(CommandHandler("today", today))
     app.add_handler(MessageHandler(filters.Regex(r"^/[^\sA-Za-z]"), arabic_router))
     app.run_polling()
 
