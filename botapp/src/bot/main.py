@@ -113,6 +113,30 @@ async def today(update: Update, ctx: Ctx) -> None:
         await _reply(update, text)
 
 
+async def post_now(update: Update, ctx: Ctx) -> None:
+    """أمر تشخيصي مؤقت: يشغّل مهمة النشر الآن ويُظهر الخطأ في المحادثة (احذفه بعد الإصلاح)."""
+    s = _settings(ctx)
+    writer: Writer = ctx.bot_data["writer"]
+    await _reply(update, "جارٍ تشغيل مهمة النشر...")
+    try:
+        st = await post_news(ctx.bot, s, writer)
+    except Exception as e:
+        log.exception("post_news failed")
+        await _reply(update, "فشلت المهمة:\n" + html.escape(repr(e))[:600])
+        return
+    msg = (
+        f"جُلب: {st['fetched']}\n"
+        f"مكرر (نُشر سابقاً): {st['duplicates']}\n"
+        f"محجوب (نسائي): {st['womens']}\n"
+        f"فشل: {st['failed']}\n"
+        f"نُشر الآن: {st['posted']}\n"
+        f"الحد الأقصى لكل دورة: {st['max_per_run']}"
+    )
+    if st["last_error"]:
+        msg += "\nآخر خطأ: " + html.escape(st["last_error"])
+    await _reply(update, msg)
+
+
 async def start(update: Update, _ctx: Ctx) -> None:
     await _reply(
         update,
@@ -197,6 +221,7 @@ def main() -> None:
     app.add_handler(CommandHandler("injuries", injuries))
     app.add_handler(CommandHandler("transfers", transfers))
     app.add_handler(CommandHandler("today", today))
+    app.add_handler(CommandHandler("post", post_now))
     app.add_handler(MessageHandler(filters.Regex(r"^/[^\sA-Za-z]"), arabic_router))
     app.run_polling()
 
