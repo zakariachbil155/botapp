@@ -165,6 +165,7 @@ async def _post_init(app: Application) -> None:  # type: ignore[type-arg]
         minutes=settings.post_interval_minutes,
         args=[app.bot, settings, writer],
         max_instances=1,
+        next_run_time=datetime.now(fixtures.TZ),  # شغّل فوراً عند الإقلاع
     )
     # منشور مباريات اليوم كل صباح 10:30 بتوقيت المغرب
     scheduler.add_job(
