@@ -62,26 +62,45 @@ async def _publish(bot: Bot, settings: Settings, entry: Entry, text: str) -> Non
     )
 
 
-async def post_news(bot: Bot, settings: Settings, writer: Writer) -> None:
-    """Scheduled job: rewrite fresh news items and publish them to the channel."""
+async def post_news(bot: Bot, settings: Settings, writer: Writer) -> dict:
+    """Scheduled job: rewrite fresh news items and publish them to the channel.
+
+    Returns a stats dict (ignored by the scheduler, shown by the /post command).
+    """
+    stats = {
+        "fetched": 0,
+        "duplicates": 0,
+        "womens": 0,
+        "failed": 0,
+        "posted": 0,
+        "max_per_run": settings.max_posts_per_run,
+        "last_error": "",
+    }
     if not settings.channel_id:
         log.warning("CHANNEL_ID is not set; skipping scheduled posting")
-        return
+        stats["last_error"] = "CHANNEL_ID is not set"
+        return stats
     entries = await fetch_entries(settings.news_feeds)
-    posted = 0
+    stats["fetched"] = len(entries)
     for entry in entries:
-        if posted >= settings.max_posts_per_run:
+        if stats["posted"] >= settings.max_posts_per_run:
             break
         if _already_posted(entry.link):
+            stats["duplicates"] += 1
             continue
         # Skip women's football before spending an AI call on it.
         if is_womens(entry):
+            stats["womens"] += 1
             log.info("Skipping women's football item: %s", entry.title)
             continue
         try:
             text = await writer.rewrite(entry)
             await _publish(bot, settings, entry, text)
             _mark_posted(entry.link)
-            posted += 1
-        except Exception:
+            stats["posted"] += 1
+        except Exception as e:
+            stats["failed"] += 1
+            stats["last_error"] = repr(e)[:300]
             log.exception("Failed to post %s", entry.link)
+    log.info("post_news finished: %s", stats)
+    return stats
