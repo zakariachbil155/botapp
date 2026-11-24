@@ -2,6 +2,7 @@ import html
 import logging
 from datetime import datetime
 
+from apscheduler.events import EVENT_JOB_ERROR
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
 from telegram.constants import ParseMode
@@ -152,7 +153,12 @@ async def arabic_router(update: Update, ctx: Ctx) -> None:
 async def _post_init(app: Application) -> None:  # type: ignore[type-arg]
     settings: Settings = app.bot_data["settings"]
     writer: Writer = app.bot_data["writer"]
-    scheduler = AsyncIOScheduler()
+    scheduler = AsyncIOScheduler(timezone=fixtures.TZ.key)
+
+    def _on_error(event) -> None:  # type: ignore[no-untyped-def]
+        log.error("Scheduled job failed: %s", event.job_id, exc_info=event.exception)
+
+    scheduler.add_listener(_on_error, EVENT_JOB_ERROR)
     scheduler.add_job(
         post_news,
         "interval",
@@ -166,7 +172,7 @@ async def _post_init(app: Application) -> None:  # type: ignore[type-arg]
         "cron",
         hour=10,
         minute=30,
-        timezone=fixtures.TZ,
+        timezone=fixtures.TZ.key,
         args=[app.bot, settings],
         max_instances=1,
         coalesce=True,
