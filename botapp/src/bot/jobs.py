@@ -7,6 +7,7 @@ from telegram.constants import ParseMode
 
 from src.bot.config import Settings
 from src.bot.feeds import Entry, fetch_entries
+from src.bot.filters import is_womens
 from src.bot.models import PostedItem
 from src.bot.writer import Writer
 from src.db.session import SessionLocal
@@ -72,6 +73,10 @@ async def post_news(bot: Bot, settings: Settings, writer: Writer) -> None:
         if posted >= settings.max_posts_per_run:
             break
         if _already_posted(entry.link):
+            continue
+        # Skip women's football before spending an AI call on it.
+        if is_womens(entry):
+            log.info("Skipping women's football item: %s", entry.title)
             continue
         try:
             text = await writer.rewrite(entry)
