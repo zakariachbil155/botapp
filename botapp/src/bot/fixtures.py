@@ -4,8 +4,9 @@
 والألماني والفرنسي، ودوري أبطال أوروبا، وكأس العالم، وأمم أوروبا.
 لا تغطي الدوري المغربي ولا الدوريات العربية ولا الإفريقية.
 
-المفتاح: settings.football_token (نفسه المستعمل في /results و/table).
-متغير البيئة TIMEZONE اختياري، الافتراضي Africa/Casablanca.
+متغيرات البيئة:
+    FOOTBALL_DATA_API_KEY   مفتاح football-data.org (مطلوب)
+    TIMEZONE                اختياري، الافتراضي Africa/Casablanca
 """
 import html
 import logging
@@ -103,11 +104,14 @@ def _day_label(d: datetime) -> str:
 
 
 async def fetch_matches(
-    day: datetime, token: str, client: httpx.AsyncClient | None = None
+    day: datetime,
+    token: str | None = None,
+    client: httpx.AsyncClient | None = None,
 ) -> list[dict]:
     """يجلب مباريات اليوم (بتوقيت المغرب). نطلب يوماً قبل وبعد ثم نفلتر محلياً بسبب فرق UTC."""
-    if not token:
-        log.warning("football token is not set; cannot fetch fixtures")
+    key = token or os.getenv("FOOTBALL_DATA_API_KEY", "")
+    if not key:
+        log.warning("football-data API key is not set; skipping fixtures")
         return []
     params = {
         "competitions": COMPETITIONS,
@@ -117,7 +121,7 @@ async def fetch_matches(
     own = client is None
     client = client or httpx.AsyncClient(timeout=20)
     try:
-        r = await client.get(API_URL, params=params, headers={"X-Auth-Token": token})
+        r = await client.get(API_URL, params=params, headers={"X-Auth-Token": key})
         r.raise_for_status()
         return r.json().get("matches", [])
     finally:
