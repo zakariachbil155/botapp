@@ -32,6 +32,7 @@ COMPETITIONS = "PL,PD,SA,BL1,FL1,CL,WC,EC"
 # مسابقات تُنشر كل مبارياتها، وغيرها لا يُنشر إلا إذا كان فيه نادٍ كبير
 ALWAYS = {"CL", "WC", "EC"}
 SKIP_STATUS = {"CANCELLED", "POSTPONED", "SUSPENDED"}
+FINISHED_WORDS = {"match finished", "ft", "finished", "aet", "after extra time", "pen", "after penalties", "aot"}
 
 COMP_AR = {
     "PL": "🏴 الدوري الإنجليزي الممتاز",
@@ -241,23 +242,31 @@ async def fetch_extra(day: datetime, client: httpx.AsyncClient | None = None) ->
     return out
 
 
-def _collect(matches: list[dict], extra: list[dict], day: datetime) -> dict[str, dict]:
+def _collect(
+    matches: list[dict], extra: list[dict], day: datetime, results: bool = False
+) -> dict[str, dict]:
     """يوحّد المصدرين: {مفتاح: {"title": عنوان, "rank": ترتيب, "rows": [(وقت، سطر)]}}."""
     groups: dict[str, dict] = {}
 
-    def add(key, title, rank, kick, home, away):
+    def add(key, title, rank, kick, home, away, score=None):
         hn, hbig, hflag = home
         an, abig, aflag = away
         star = "🔥 " if hbig and abig else ""
         h = f"{hflag} {hn}".strip()
         a = f"{aflag} {an}".strip()
-        line = f"{RLM}🕒 <code>{kick:%H:%M}</code> ┃ {star}{html.escape(h)} ⚔️ {html.escape(a)}"
+        if score is not None:
+            line = f"{RLM}{star}{html.escape(h)} <b>({score[0]})</b> ⚔️ <b>({score[1]})</b> {html.escape(a)}{score[2]}"
+        else:
+            line = f"{RLM}🕒 <code>{kick:%H:%M}</code> ┃ {star}{html.escape(h)} ⚔️ {html.escape(a)}"
         g = groups.setdefault(key, {"title": title, "rank": rank, "rows": []})
         if (kick, line) not in g["rows"]:
             g["rows"].append((kick, line))
 
     for m in matches:
-        if m.get("status") in SKIP_STATUS:
+        if results:
+            if m.get("status") != "FINISHED":
+                continue
+        elif m.get("status") in SKIP_STATUS:
             continue
         try:
             kick = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00")).astimezone(TZ)
@@ -272,7 +281,18 @@ def _collect(matches: list[dict], extra: list[dict], day: datetime) -> dict[str,
         away = _team((m.get("awayTeam") or {}).get("name", ""))
         if code not in ALWAYS and not (home[1] or away[1]):
             continue
-        add(code, COMP_AR[code], COMP_ORDER.index(code), kick, home, away)
+        score = None
+        if results:
+            sc = m.get("score") or {}
+            ft = sc.get("fullTime") or {}
+            if ft.get("home") is None or ft.get("away") is None:
+                continue
+            pen = sc.get("penalties") or {}
+            note = ""
+            if sc.get("duration") == "PENALTY_SHOOTOUT" and pen.get("home") is not None:
+                note = f" <i>(ركلات الترجيح {pen['home']}-{pen['away']})</i>"
+            score = (ft["home"], ft["away"], note)
+        add(code, COMP_AR[code], COMP_ORDER.index(code), kick, home, away, score)
 
     for e in extra:
         league = (e.get("strLeague") or "").strip()
@@ -295,7 +315,14 @@ def _collect(matches: list[dict], extra: list[dict], day: datetime) -> dict[str,
         if not (home[1] or away[1]):
             continue
         rank = 100 + next((i for i, em in enumerate(EXTRA_ORDER) if title.startswith(em)), 50)
-        add("X:" + title, title, rank, kick, home, away)
+        score = None
+        if results:
+            hs, as_ = e.get("intHomeScore"), e.get("intAwayScore")
+            done = (e.get("strStatus") or "").lower() in FINISHED_WORDS
+            if hs in (None, "") or as_ in (None, "") or not done:
+                continue
+            score = (hs, as_, "")
+        add("X:" + title, title, rank, kick, home, away, score)
     return groups
 
 
@@ -328,6 +355,53 @@ def build_messages(matches: list[dict], day: datetime, extra: list[dict] | None 
             cur += "\n\n" + b
     messages.append(cur + "\n\n" + footer)
     return messages
+
+
+def build_results_messages(
+    matches: list[dict], day: datetime, extra: list[dict] | None = None
+) -> list[str]:
+    """نتائج اليوم للمباريات المنتهية فقط. قائمة فارغة إن لم تنتهِ أي مباراة مهمة."""
+    groups = _collect(matches, extra or [], day, results=True)
+    if not groups:
+        return []
+    total = sum(len(g["rows"]) for g in groups.values())
+    sep = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
+    header = f"📊 <b>نتائج اليوم</b>\n🗓 {_day_label(day)}\n✅ {total} مباراة منتهية\n{sep}"
+    footer = f"{sep}\n🔥 = مواجهة بين طرفين كبيرين\n\n#نتائج_المباريات #كرة_القدم"
+    blocks = []
+    for g in sorted(groups.values(), key=lambda x: x["rank"]):
+        lines = [ln for _, ln in sorted(g["rows"])]
+        blocks.append(f"<b>{g['title']}</b>\n" + "\n".join(lines))
+    messages, cur = [], header
+    for b in blocks:
+        if len(cur) + len(b) + len(footer) + 4 > MESSAGE_MAX:
+            messages.append(cur)
+            cur = b
+        else:
+            cur += "\n\n" + b
+    messages.append(cur + "\n\n" + footer)
+    return messages
+
+
+async def post_todays_results(bot: Bot, settings: Settings) -> None:
+    """مهمة مجدولة: تنشر نتائج مباريات اليوم المنتهية في القناة."""
+    if not settings.channel_id:
+        log.warning("CHANNEL_ID is not set; skipping results post")
+        return
+    today = datetime.now(TZ)
+    try:
+        matches = await fetch_matches(today, settings.football_token)
+    except Exception:
+        log.exception("Failed to fetch today's results")
+        matches = []
+    extra = await fetch_extra(today)
+    for text in build_results_messages(matches, today, extra):
+        await bot.send_message(
+            chat_id=settings.channel_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
 
 
 async def post_todays_fixtures(bot: Bot, settings: Settings) -> None:
