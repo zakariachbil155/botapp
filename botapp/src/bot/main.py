@@ -200,7 +200,13 @@ async def _post_init(app: Application) -> None:  # type: ignore[type-arg]
         misfire_grace_time=3600,
     )
     # نتائج مباريات اليوم كل مساء 22:00 بتوقيت المغرب (RESULTS_TIME=HH:MM لتغييره)
-    rh, rm = (int(x) for x in os.getenv("RESULTS_TIME", "22:00").split(":"))
+    try:
+        rh, rm = (int(x) for x in (os.getenv("RESULTS_TIME") or "22:00").strip().split(":"))
+        if not (0 <= rh <= 23 and 0 <= rm <= 59):
+            raise ValueError
+    except ValueError:
+        log.warning("Invalid RESULTS_TIME; falling back to 22:00")
+        rh, rm = 22, 0
     scheduler.add_job(
         fixtures.post_todays_results,
         "cron",
