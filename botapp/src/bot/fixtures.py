@@ -383,6 +383,32 @@ def build_results_messages(
     return messages
 
 
+def demo_results(day: datetime) -> list[str]:
+    """منشور نتائج تجريبي (بيانات وهمية) لمعاينة الشكل فقط."""
+    d = day.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%d")
+
+    def fin(code, h, a, hs, as_, t, pen=None):
+        sc = {"fullTime": {"home": hs, "away": as_}}
+        if pen:
+            sc["penalties"] = {"home": pen[0], "away": pen[1]}
+            sc["duration"] = "PENALTY_SHOOTOUT"
+        return {"competition": {"code": code}, "homeTeam": {"name": h}, "awayTeam": {"name": a},
+                "utcDate": f"{d}T{t}:00Z", "status": "FINISHED", "score": sc}
+
+    ms = [
+        fin("CL", "Real Madrid CF", "Paris Saint-Germain FC", 2, 1, "20:00"),
+        fin("CL", "Arsenal FC", "FC Bayern München", 1, 1, "17:45", (4, 3)),
+        fin("PL", "Everton FC", "Liverpool FC", 0, 2, "19:30"),
+    ]
+    ex = [
+        {"strLeague": "Saudi Pro League", "strHomeTeam": "Al-Hilal", "strAwayTeam": "Al-Nassr",
+         "strTimestamp": f"{d}T17:00:00", "intHomeScore": "3", "intAwayScore": "1", "strStatus": "Match Finished"},
+        {"strLeague": "International Friendlies", "strHomeTeam": "Morocco", "strAwayTeam": "Senegal",
+         "strTimestamp": f"{d}T19:00:00", "intHomeScore": "2", "intAwayScore": "0", "strStatus": "Match Finished"},
+    ]
+    return build_results_messages(ms, day, ex)
+
+
 async def post_todays_results(bot: Bot, settings: Settings) -> None:
     """مهمة مجدولة: تنشر نتائج مباريات اليوم المنتهية في القناة."""
     if not settings.channel_id:
