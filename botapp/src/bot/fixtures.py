@@ -2,11 +2,11 @@
 
 المصدر: football-data.org (الخطة المجانية). تغطي: الدوري الإنجليزي والإسباني والإيطالي
 والألماني والفرنسي، ودوري أبطال أوروبا، وكأس العالم، وأمم أوروبا.
-لا تغطي الدوري المغربي ولا الدوريات العربية ولا الإفريقية.
+للدوريات العربية والإفريقية والمنتخبات (ودية/تصفيات) يُستعمل مصدر مجاني إضافي (TheSportsDB)
+بأفضل جهد: إن فشل يُكتفى بالمصدر الأول دون أي خطأ.
 
-متغيرات البيئة:
-    FOOTBALL_DATA_API_KEY   مفتاح football-data.org (مطلوب)
-    TIMEZONE                اختياري، الافتراضي Africa/Casablanca
+المفتاح: settings.football_token (نفسه المستعمل في /results و/table).
+متغير البيئة TIMEZONE اختياري، الافتراضي Africa/Casablanca.
 """
 import html
 import logging
@@ -34,7 +34,7 @@ ALWAYS = {"CL", "WC", "EC"}
 SKIP_STATUS = {"CANCELLED", "POSTPONED", "SUSPENDED"}
 
 COMP_AR = {
-    "PL": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 الدوري الإنجليزي الممتاز",
+    "PL": "🏴 الدوري الإنجليزي الممتاز",
     "PD": "🇪🇸 الدوري الإسباني",
     "SA": "🇮🇹 الدوري الإيطالي",
     "BL1": "🇩🇪 الدوري الألماني",
@@ -45,58 +45,153 @@ COMP_AR = {
 }
 COMP_ORDER = ["CL", "WC", "EC", "PL", "PD", "SA", "BL1", "FL1"]
 
-# (جزء من الاسم الإنجليزي بحروف صغيرة، الاسم العربي، نادٍ كبير؟)
-# الترتيب مهم: الأطول والأخص أولاً (internazionale قبل milan).
+# مصدر إضافي مجاني للدوريات العربية والمنتخبات (اسم الدوري عند المصدر -> عنوان عربي)
+EXTRA_URL = "https://www.thesportsdb.com/api/v1/json/3/eventsday.php"
+EXTRA_LEAGUES = {
+    "saudi pro league": "🇸🇦 دوري روشن السعودي",
+    "saudi professional league": "🇸🇦 دوري روشن السعودي",
+    "egyptian premier league": "🇪🇬 الدوري المصري",
+    "moroccan botola pro": "🇲🇦 البطولة الاحترافية المغربية",
+    "botola pro": "🇲🇦 البطولة الاحترافية المغربية",
+    "algerian ligue professionnelle 1": "🇩🇿 الدوري الجزائري",
+    "tunisian ligue professionnelle 1": "🇹🇳 الدوري التونسي",
+    "caf champions league": "🌍 دوري أبطال إفريقيا",
+    "caf confederation cup": "🌍 كأس الكونفدرالية الإفريقية",
+    "afc champions league elite": "🌏 دوري أبطال آسيا",
+    "arab cup": "🏆 كأس العرب",
+    "africa cup of nations": "🏆 كأس أمم إفريقيا",
+    "international friendlies": "🤝 مباريات ودية دولية",
+    "friendlies": "🤝 مباريات ودية دولية",
+    "fifa world cup qualifying": "🌍 تصفيات كأس العالم",
+    "world cup qualifying": "🌍 تصفيات كأس العالم",
+    "uefa nations league": "🇪🇺 دوري الأمم الأوروبية",
+    "uefa european championship qualifying": "🇪🇺 تصفيات أمم أوروبا",
+}
+EXTRA_ORDER = ["🌍", "🏆", "🤝", "🇪🇺", "🇸🇦", "🇪🇬", "🇲🇦", "🇩🇿", "🇹🇳", "🌏"]
+
+# (مفتاح إنجليزي بحروف صغيرة، الاسم العربي، مهم؟، علم المنتخب أو "")
+# الترتيب مهم: الأطول والأخص أولاً.
 TEAMS = [
-    ("real madrid", "ريال مدريد", True), ("paris saint", "باريس سان جيرمان", True),
-    ("barcelona", "برشلونة", True), ("atlético", "أتلتيكو مدريد", True),
-    ("atletico", "أتلتيكو مدريد", True),
-    ("manchester city", "مانشستر سيتي", True), ("manchester united", "مانشستر يونايتد", True),
-    ("liverpool", "ليفربول", True), ("arsenal", "أرسنال", True), ("chelsea", "تشيلسي", True),
-    ("tottenham", "توتنهام", True), ("juventus", "يوفنتوس", True),
-    ("internazionale", "إنتر ميلان", True), ("ac milan", "ميلان", True), ("napoli", "نابولي", True),
-    ("bayern", "بايرن ميونخ", True), ("dortmund", "بوروسيا دورتموند", True),
-    ("leverkusen", "باير ليفركوزن", True), ("marseille", "مارسيليا", True),
-    ("monaco", "موناكو", True), ("benfica", "بنفيكا", True), ("porto", "بورتو", True),
-    ("sporting", "سبورتينغ لشبونة", True), ("ajax", "أياكس", True),
-    ("galatasaray", "غلطة سراي", True), ("fenerbahçe", "فنربخشة", True),
-    ("fenerbahce", "فنربخشة", True), ("celtic", "سيلتيك", True),
-    # أندية أخرى للترجمة فقط
-    ("newcastle", "نيوكاسل", False), ("aston villa", "أستون فيلا", False),
-    ("west ham", "وست هام", False), ("brighton", "برايتون", False), ("everton", "إيفرتون", False),
-    ("sevilla", "إشبيلية", False), ("real sociedad", "ريال سوسيداد", False),
-    ("villarreal", "فياريال", False), ("athletic", "أتلتيك بيلباو", False),
-    ("valencia", "فالنسيا", False), ("betis", "ريال بيتيس", False),
-    ("roma", "روما", False), ("lazio", "لاتسيو", False), ("atalanta", "أتالانتا", False),
-    ("fiorentina", "فيورنتينا", False), ("lyonnais", "ليون", False), ("lille", "ليل", False),
-    ("nice", "نيس", False), ("leipzig", "لايبزيغ", False), ("frankfurt", "آينتراخت فرانكفورت", False),
-    ("stuttgart", "شتوتغارت", False),
-    # منتخبات
-    ("morocco", "المغرب", True), ("algeria", "الجزائر", True), ("tunisia", "تونس", True),
-    ("egypt", "مصر", True), ("saudi", "السعودية", True), ("qatar", "قطر", True),
-    ("france", "فرنسا", True), ("spain", "إسبانيا", True), ("england", "إنجلترا", True),
-    ("germany", "ألمانيا", True), ("italy", "إيطاليا", True), ("portugal", "البرتغال", True),
-    ("brazil", "البرازيل", True), ("argentina", "الأرجنتين", True),
-    ("netherlands", "هولندا", True), ("belgium", "بلجيكا", True),
+    # إسبانيا
+    ("real madrid", "ريال مدريد", True, ""), ("barcelona", "برشلونة", True, ""),
+    ("atlético", "أتلتيكو مدريد", True, ""), ("atletico", "أتلتيكو مدريد", True, ""),
+    ("sevilla", "إشبيلية", False, ""), ("real sociedad", "ريال سوسيداد", False, ""),
+    ("villarreal", "فياريال", False, ""), ("athletic", "أتلتيك بيلباو", False, ""),
+    ("valencia", "فالنسيا", False, ""), ("betis", "ريال بيتيس", False, ""),
+    ("girona", "جيرونا", False, ""),
+    # إنجلترا
+    ("manchester city", "مانشستر سيتي", True, ""), ("manchester united", "مانشستر يونايتد", True, ""),
+    ("liverpool", "ليفربول", True, ""), ("arsenal", "أرسنال", True, ""), ("chelsea", "تشيلسي", True, ""),
+    ("tottenham", "توتنهام", True, ""), ("newcastle", "نيوكاسل", False, ""),
+    ("aston villa", "أستون فيلا", False, ""), ("west ham", "وست هام", False, ""),
+    ("brighton", "برايتون", False, ""), ("everton", "إيفرتون", False, ""),
+    ("crystal palace", "كريستال بالاس", False, ""), ("fulham", "فولهام", False, ""),
+    # إيطاليا
+    ("juventus", "يوفنتوس", True, ""), ("internazionale", "إنتر ميلان", True, ""),
+    ("inter milan", "إنتر ميلان", True, ""), ("ac milan", "ميلان", True, ""),
+    ("napoli", "نابولي", True, ""), ("roma", "روما", False, ""), ("lazio", "لاتسيو", False, ""),
+    ("atalanta", "أتالانتا", False, ""), ("fiorentina", "فيورنتينا", False, ""),
+    ("como", "كومو", False, ""), ("bologna", "بولونيا", False, ""),
+    # ألمانيا
+    ("bayern", "بايرن ميونخ", True, ""), ("dortmund", "بوروسيا دورتموند", True, ""),
+    ("leverkusen", "باير ليفركوزن", True, ""), ("leipzig", "لايبزيغ", False, ""),
+    ("frankfurt", "آينتراخت فرانكفورت", False, ""), ("stuttgart", "شتوتغارت", False, ""),
+    # فرنسا
+    ("paris saint", "باريس سان جيرمان", True, ""), ("paris sg", "باريس سان جيرمان", True, ""),
+    ("marseille", "مارسيليا", True, ""), ("monaco", "موناكو", True, ""),
+    ("lyonnais", "ليون", False, ""), ("lyon", "ليون", False, ""), ("lille", "ليل", False, ""),
+    ("nice", "نيس", False, ""), ("lens", "لانس", False, ""),
+    # أوروبا
+    ("benfica", "بنفيكا", True, ""), ("porto", "بورتو", True, ""),
+    ("sporting", "سبورتينغ لشبونة", True, ""), ("ajax", "أياكس", True, ""),
+    ("psv", "آيندهوفن", False, ""), ("feyenoord", "فينورد", False, ""),
+    ("galatasaray", "غلطة سراي", True, ""), ("fenerbahçe", "فنربخشة", True, ""),
+    ("fenerbahce", "فنربخشة", True, ""), ("besiktas", "بشكتاش", False, ""),
+    ("celtic", "سيلتيك", True, ""), ("rangers", "رينجرز", False, ""),
+    ("club brugge", "كلوب بروج", False, ""), ("olympiacos", "أولمبياكوس", False, ""),
+    ("shakhtar", "شاختار دونيتسك", False, ""), ("red star", "النجم الأحمر", False, ""),
+    ("crvena zvezda", "النجم الأحمر", False, ""), ("salzburg", "سالزبورغ", False, ""),
+    ("bodø/glimt", "بودو غليمت", False, ""), ("bodo/glimt", "بودو غليمت", False, ""),
+    ("pae aek", "إيه إي كيه أثينا", False, ""), ("aek athens", "إيه إي كيه أثينا", False, ""),
+    ("slovan", "سلوفان براتيسلافا", False, ""), ("lask", "لاسك", False, ""),
+    # أندية سعودية
+    ("al-hilal", "الهلال", True, "🇸🇦"), ("al hilal", "الهلال", True, "🇸🇦"),
+    ("al-nassr", "النصر", True, "🇸🇦"), ("al nassr", "النصر", True, "🇸🇦"),
+    ("al-ittihad", "الاتحاد", True, "🇸🇦"), ("al ittihad", "الاتحاد", True, "🇸🇦"),
+    ("al-ahli saudi", "الأهلي السعودي", True, "🇸🇦"), ("al-ahli jeddah", "الأهلي السعودي", True, "🇸🇦"),
+    ("al-shabab", "الشباب", False, "🇸🇦"), ("al-ettifaq", "الاتفاق", False, "🇸🇦"),
+    ("al-fateh", "الفتح", False, "🇸🇦"), ("al-taawoun", "التعاون", False, "🇸🇦"),
+    # أندية مصرية
+    ("al ahly", "الأهلي المصري", True, "🇪🇬"), ("al-ahly", "الأهلي المصري", True, "🇪🇬"),
+    ("zamalek", "الزمالك", True, "🇪🇬"), ("pyramids", "بيراميدز", True, "🇪🇬"),
+    ("al masry", "المصري البورسعيدي", False, "🇪🇬"), ("ismaily", "الإسماعيلي", False, "🇪🇬"),
+    # أندية مغربية
+    ("wydad", "الوداد", True, "🇲🇦"), ("raja", "الرجاء", True, "🇲🇦"),
+    ("far rabat", "الجيش الملكي", True, "🇲🇦"), ("as far", "الجيش الملكي", True, "🇲🇦"),
+    ("maghreb fassi", "المغرب الفاسي", False, "🇲🇦"), ("rs berkane", "نهضة بركان", True, "🇲🇦"),
+    ("berkane", "نهضة بركان", True, "🇲🇦"), ("hassania", "حسنية أكادير", False, "🇲🇦"),
+    # أندية جزائرية وتونسية
+    ("mc alger", "مولودية الجزائر", True, "🇩🇿"), ("mouloudia", "مولودية الجزائر", True, "🇩🇿"),
+    ("belouizdad", "شباب بلوزداد", True, "🇩🇿"), ("jsk", "شبيبة القبائل", False, "🇩🇿"),
+    ("kabylie", "شبيبة القبائل", False, "🇩🇿"), ("usm alger", "اتحاد العاصمة", True, "🇩🇿"),
+    ("esperance", "الترجي", True, "🇹🇳"), ("espérance", "الترجي", True, "🇹🇳"),
+    ("club africain", "النادي الإفريقي", True, "🇹🇳"), ("etoile du sahel", "النجم الساحلي", True, "🇹🇳"),
+    ("sfaxien", "الصفاقسي", False, "🇹🇳"),
+    # منتخبات عربية
+    ("morocco", "المغرب", True, "🇲🇦"), ("algeria", "الجزائر", True, "🇩🇿"),
+    ("tunisia", "تونس", True, "🇹🇳"), ("egypt", "مصر", True, "🇪🇬"),
+    ("saudi arabia", "السعودية", True, "🇸🇦"), ("saudi", "السعودية", True, "🇸🇦"),
+    ("qatar", "قطر", True, "🇶🇦"), ("united arab emirates", "الإمارات", True, "🇦🇪"),
+    ("uae", "الإمارات", True, "🇦🇪"), ("iraq", "العراق", True, "🇮🇶"),
+    ("jordan", "الأردن", True, "🇯🇴"), ("palestine", "فلسطين", True, "🇵🇸"),
+    ("oman", "عُمان", True, "🇴🇲"), ("kuwait", "الكويت", True, "🇰🇼"),
+    ("bahrain", "البحرين", True, "🇧🇭"), ("lebanon", "لبنان", True, "🇱🇧"),
+    ("syria", "سوريا", True, "🇸🇾"), ("libya", "ليبيا", True, "🇱🇾"),
+    ("sudan", "السودان", True, "🇸🇩"), ("mauritania", "موريتانيا", True, "🇲🇷"),
+    ("yemen", "اليمن", True, "🇾🇪"), ("comoros", "جزر القمر", True, "🇰🇲"),
+    # منتخبات إفريقية
+    ("senegal", "السنغال", True, "🇸🇳"), ("nigeria", "نيجيريا", True, "🇳🇬"),
+    ("ivory coast", "كوت ديفوار", True, "🇨🇮"), ("côte d", "كوت ديفوار", True, "🇨🇮"),
+    ("cameroon", "الكاميرون", True, "🇨🇲"), ("ghana", "غانا", True, "🇬🇭"),
+    ("mali", "مالي", False, "🇲🇱"), ("south africa", "جنوب إفريقيا", False, "🇿🇦"),
+    ("dr congo", "الكونغو الديمقراطية", False, "🇨🇩"),
+    # منتخبات عالمية
+    ("france", "فرنسا", True, "🇫🇷"), ("spain", "إسبانيا", True, "🇪🇸"),
+    ("england", "إنجلترا", True, "🏴"), ("germany", "ألمانيا", True, "🇩🇪"),
+    ("italy", "إيطاليا", True, "🇮🇹"), ("portugal", "البرتغال", True, "🇵🇹"),
+    ("brazil", "البرازيل", True, "🇧🇷"), ("argentina", "الأرجنتين", True, "🇦🇷"),
+    ("netherlands", "هولندا", True, "🇳🇱"), ("belgium", "بلجيكا", True, "🇧🇪"),
+    ("croatia", "كرواتيا", True, "🇭🇷"), ("uruguay", "الأوروغواي", True, "🇺🇾"),
+    ("colombia", "كولومبيا", False, "🇨🇴"), ("mexico", "المكسيك", False, "🇲🇽"),
+    ("united states", "الولايات المتحدة", False, "🇺🇸"), ("japan", "اليابان", False, "🇯🇵"),
+    ("south korea", "كوريا الجنوبية", False, "🇰🇷"), ("turkey", "تركيا", False, "🇹🇷"),
+    ("türkiye", "تركيا", False, "🇹🇷"), ("switzerland", "سويسرا", False, "🇨🇭"),
+    ("denmark", "الدنمارك", False, "🇩🇰"), ("poland", "بولندا", False, "🇵🇱"),
 ]
 
 WEEKDAYS = ["الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
 MONTHS = ["يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو",
           "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر"]
 
+# مطابقة بالكلمة الكاملة حتى لا تطابق roma مع Romania ولا nice مع Venice.
+# المسافة تطابق مسافة أو شرطة (Al Hilal / Al-Hilal).
+_PATTERNS = [
+    (re.compile(r"\b" + re.escape(k).replace(r"\ ", r"[ \-]") + r"\b"), ar, big, flag)
+    for k, ar, big, flag in TEAMS
+]
+_YOUTH = re.compile(r"\bu[ -]?(1[5-9]|2[0-3])\b|\bolympic\b", re.I)
+_WOMEN = re.compile(r"\bwomen|\bfemin|\bladies\b|\bgirls\b|\bw$", re.I)
+RLM = "&#8207;"  # علامة اتجاه من اليمين لليسار (كيان HTML بلا محارف مخفية في الملف)
 
-# مطابقة بالكلمة الكاملة حتى لا تطابق roma مع Romania ولا nice مع Venice
-_PATTERNS = [(re.compile(r"\b" + re.escape(k) + r"\b"), ar, big) for k, ar, big in TEAMS]
 
-
-def _team(name: str) -> tuple[str, bool]:
-    """يعيد (الاسم العربي، هل هو نادٍ/منتخب كبير)."""
+def _team(name: str) -> tuple[str, bool, str]:
+    """يعيد (الاسم العربي، مهم؟، علم). الاسم غير المعروف يبقى كما هو."""
     low = (name or "").lower()
-    for pat, ar, big in _PATTERNS:
+    for pat, ar, big, flag in _PATTERNS:
         if pat.search(low):
-            return ar, big
+            return ar, big, flag
     clean = (name or "؟").replace(" FC", "").replace("FC ", "").strip()
-    return clean, False
+    return clean, False, ""
 
 
 def _day_label(d: datetime) -> str:
@@ -104,14 +199,11 @@ def _day_label(d: datetime) -> str:
 
 
 async def fetch_matches(
-    day: datetime,
-    token: str | None = None,
-    client: httpx.AsyncClient | None = None,
+    day: datetime, token: str, client: httpx.AsyncClient | None = None
 ) -> list[dict]:
     """يجلب مباريات اليوم (بتوقيت المغرب). نطلب يوماً قبل وبعد ثم نفلتر محلياً بسبب فرق UTC."""
-    key = token or os.getenv("FOOTBALL_DATA_API_KEY", "")
-    if not key:
-        log.warning("football-data API key is not set; skipping fixtures")
+    if not token:
+        log.warning("football token is not set; cannot fetch fixtures")
         return []
     params = {
         "competitions": COMPETITIONS,
@@ -121,7 +213,7 @@ async def fetch_matches(
     own = client is None
     client = client or httpx.AsyncClient(timeout=20)
     try:
-        r = await client.get(API_URL, params=params, headers={"X-Auth-Token": key})
+        r = await client.get(API_URL, params=params, headers={"X-Auth-Token": token})
         r.raise_for_status()
         return r.json().get("matches", [])
     finally:
@@ -129,9 +221,41 @@ async def fetch_matches(
             await client.aclose()
 
 
-def build_messages(matches: list[dict], day: datetime) -> list[str]:
-    """يبني نص المنشور (قد يكون أكثر من رسالة إن طال). قائمة فارغة إن لم توجد مباريات."""
-    groups: dict[str, list[tuple[datetime, str]]] = {}
+async def fetch_extra(day: datetime, client: httpx.AsyncClient | None = None) -> list[dict]:
+    """مباريات الدوريات العربية والمنتخبات من TheSportsDB. أي فشل يعيد قائمة فارغة."""
+    own = client is None
+    client = client or httpx.AsyncClient(timeout=20)
+    out: list[dict] = []
+    try:
+        for delta in (-1, 0, 1):
+            d = (day + timedelta(days=delta)).strftime("%Y-%m-%d")
+            try:
+                r = await client.get(EXTRA_URL, params={"d": d, "s": "Soccer"})
+                r.raise_for_status()
+                out.extend(r.json().get("events") or [])
+            except Exception:
+                log.warning("extra fixtures source failed for %s", d, exc_info=True)
+    finally:
+        if own:
+            await client.aclose()
+    return out
+
+
+def _collect(matches: list[dict], extra: list[dict], day: datetime) -> dict[str, dict]:
+    """يوحّد المصدرين: {مفتاح: {"title": عنوان, "rank": ترتيب, "rows": [(وقت، سطر)]}}."""
+    groups: dict[str, dict] = {}
+
+    def add(key, title, rank, kick, home, away):
+        hn, hbig, hflag = home
+        an, abig, aflag = away
+        star = "🔥 " if hbig and abig else ""
+        h = f"{hflag} {hn}".strip()
+        a = f"{aflag} {an}".strip()
+        line = f"{RLM}🕒 <code>{kick:%H:%M}</code> ┃ {star}{html.escape(h)} ⚔️ {html.escape(a)}"
+        g = groups.setdefault(key, {"title": title, "rank": rank, "rows": []})
+        if (kick, line) not in g["rows"]:
+            g["rows"].append((kick, line))
+
     for m in matches:
         if m.get("status") in SKIP_STATUS:
             continue
@@ -144,23 +268,56 @@ def build_messages(matches: list[dict], day: datetime) -> list[str]:
         code = (m.get("competition") or {}).get("code", "")
         if code not in COMP_AR:
             continue
-        home, hbig = _team((m.get("homeTeam") or {}).get("name", ""))
-        away, abig = _team((m.get("awayTeam") or {}).get("name", ""))
-        if code not in ALWAYS and not (hbig or abig):
+        home = _team((m.get("homeTeam") or {}).get("name", ""))
+        away = _team((m.get("awayTeam") or {}).get("name", ""))
+        if code not in ALWAYS and not (home[1] or away[1]):
             continue
-        line = f"🕒 {kick:%H:%M} | {html.escape(home)} 🆚 {html.escape(away)}"
-        groups.setdefault(code, []).append((kick, line))
+        add(code, COMP_AR[code], COMP_ORDER.index(code), kick, home, away)
 
+    for e in extra:
+        league = (e.get("strLeague") or "").strip()
+        title = EXTRA_LEAGUES.get(league.lower())
+        hname, aname = e.get("strHomeTeam") or "", e.get("strAwayTeam") or ""
+        if not title or not hname or not aname:
+            continue
+        if _WOMEN.search(hname + " " + aname + " " + league) or _YOUTH.search(hname + " " + aname):
+            continue
+        ts = e.get("strTimestamp") or ""
+        try:
+            if not ts and e.get("dateEvent") and e.get("strTime"):
+                ts = f"{e['dateEvent']}T{e['strTime']}"
+            kick = datetime.fromisoformat(ts.replace("Z", "")).replace(tzinfo=ZoneInfo("UTC")).astimezone(TZ)
+        except ValueError:
+            continue
+        if kick.date() != day.date():
+            continue
+        home, away = _team(hname), _team(aname)
+        if not (home[1] or away[1]):
+            continue
+        rank = 100 + next((i for i, em in enumerate(EXTRA_ORDER) if title.startswith(em)), 50)
+        add("X:" + title, title, rank, kick, home, away)
+    return groups
+
+
+def build_messages(matches: list[dict], day: datetime, extra: list[dict] | None = None) -> list[str]:
+    """يبني نص المنشور (قد يكون أكثر من رسالة إن طال). قائمة فارغة إن لم توجد مباريات."""
+    groups = _collect(matches, extra or [], day)
     if not groups:
         return []
 
-    header = f"📅 <b>مباريات اليوم</b> — {_day_label(day)}"
-    footer = "⏰ التوقيت بتوقيت المغرب"
+    total = sum(len(g["rows"]) for g in groups.values())
+    sep = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
+    header = (
+        f"📅 <b>مباريات اليوم</b>\n"
+        f"🗓 {_day_label(day)}\n"
+        f"⚽ {total} مباراة مهمة\n"
+        f"{sep}"
+    )
+    footer = f"{sep}\n⏰ جميع الأوقات بتوقيت المغرب\n🔥 = مواجهة بين طرفين كبيرين\n\n#مباريات_اليوم #كرة_القدم"
     blocks = []
-    for code in COMP_ORDER:
-        if code in groups:
-            lines = [ln for _, ln in sorted(groups[code])]
-            blocks.append(f"<b>{COMP_AR[code]}</b>\n" + "\n".join(lines))
+    for g in sorted(groups.values(), key=lambda x: x["rank"]):
+        lines = [ln for _, ln in sorted(g["rows"])]
+        blocks.append(f"<b>{g['title']}</b>\n" + "\n".join(lines))
 
     messages, cur = [], header
     for b in blocks:
@@ -183,8 +340,9 @@ async def post_todays_fixtures(bot: Bot, settings: Settings) -> None:
         matches = await fetch_matches(today, settings.football_token)
     except Exception:
         log.exception("Failed to fetch today's fixtures")
-        return
-    for text in build_messages(matches, today):
+        matches = []
+    extra = await fetch_extra(today)
+    for text in build_messages(matches, today, extra):
         await bot.send_message(
             chat_id=settings.channel_id,
             text=text,
