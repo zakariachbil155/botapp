@@ -32,7 +32,7 @@ SYSTEM_PROMPT = """أنت محرر رياضي في صحيفة عربية كبر�
 - انتقال لاعب أو مفاوضات: 🔄
 - إصابة أو غياب: 🏥
 - تتويج أو لقب: 🏆
-- إقالة أو تعيين مدرب: 🧑‍💼
+- إقالة أو تعيين مدرب: 👔
 - رقم قياسي أو إحصائية: 📊
 - قرار تحكيمي أو عقوبة: 🟨
 - خبر عاجل أو رسمي مهم: 🚨
@@ -43,6 +43,11 @@ SYSTEM_PROMPT = """أنت محرر رياضي في صحيفة عربية كبر�
 - تخص النادي واللاعب والبطولة والموضوع الوارد في الخبر فقط، ولا تخترع وسوماً عامة.
 - سطر الوسوم هو آخر سطر في الرد.
 
+قواعد الرفض (مهمة جداً):
+- إن لم يكن الخبر عن كرة القدم للرجال (فيلم، موسيقى، رياضة أخرى، خبر عام)، أو كان عن كرة القدم النسائية
+  (فريق نسائي، لاعبة، "she/her"، Women، WSL، Lionesses)، فاكتب كلمة واحدة فقط: SKIP
+- لا تكتب اعتذاراً ولا شرحاً أبداً. إما المنشور بالتنسيق أعلاه أو SKIP.
+
 قواعد عامة:
 - أبقِ أسماء اللاعبين والأندية دقيقة بالتهجئة العربية الشائعة.
 - لا تخترع أي معلومة أو رقم أو تصريح غير موجود في النص.
@@ -51,8 +56,19 @@ SYSTEM_PROMPT = """أنت محرر رياضي في صحيفة عربية كبر�
 - الطول الكلي متوسط: بين 200 و300 حرف، ولا تكرر في التفاصيل ما قلته في الملخص.
 """
 
+_REFUSAL = re.compile(r"(عذر[اً]ً?|عذرًا|لا يمكنني|لا أستطيع|آسف|sorry|cannot|can't)", re.I)
+
+
+def is_skip(raw: str) -> bool:
+    """True إذا رفض النموذج الخبر (SKIP) أو كتب اعتذاراً بدل المنشور."""
+    t = raw.strip().strip("`*\"' ").upper()
+    if not t or t.startswith("SKIP"):
+        return True
+    return len(raw) < 400 and bool(_REFUSAL.search(raw[:60])) and "📌" not in raw
+
+
 _URL = re.compile(r"https?://\S+")
-_TAG = re.compile(r"#[\w؀-ۿ]+")
+_TAG = re.compile(r"#[\w\u0600-\u06FF]+")
 
 
 def _split_tags(text: str) -> tuple[str, list[str]]:
@@ -145,4 +161,7 @@ class Writer:
                 {"role": "user", "content": f"العنوان: {entry.title}\n\nالتفاصيل: {entry.summary}"},
             ],
         )
-        return _clean((completion.choices[0].message.content or "").strip())
+        raw = (completion.choices[0].message.content or "").strip()
+        if is_skip(raw):
+            return ""
+        return _clean(raw)
