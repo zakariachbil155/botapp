@@ -2,7 +2,6 @@ import html
 import logging
 from datetime import datetime
 
-from apscheduler.events import EVENT_JOB_ERROR
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
 from telegram.constants import ParseMode
@@ -105,36 +104,13 @@ async def today(update: Update, ctx: Ctx) -> None:
         log.exception("fixtures request failed")
         await _reply(update, "تعذّر جلب المباريات الآن، حاول بعد قليل.")
         return
-    messages = fixtures.build_messages(matches, now)
+    extra = await fixtures.fetch_extra(now)
+    messages = fixtures.build_messages(matches, now, extra)
     if not messages:
         await _reply(update, "لا توجد مباريات مهمة اليوم.")
         return
     for text in messages:
         await _reply(update, text)
-
-
-async def post_now(update: Update, ctx: Ctx) -> None:
-    """أمر تشخيصي مؤقت: يشغّل مهمة النشر الآن ويُظهر الخطأ في المحادثة (احذفه بعد الإصلاح)."""
-    s = _settings(ctx)
-    writer: Writer = ctx.bot_data["writer"]
-    await _reply(update, "جارٍ تشغيل مهمة النشر...")
-    try:
-        st = await post_news(ctx.bot, s, writer)
-    except Exception as e:
-        log.exception("post_news failed")
-        await _reply(update, "فشلت المهمة:\n" + html.escape(repr(e))[:600])
-        return
-    msg = (
-        f"جُلب: {st['fetched']}\n"
-        f"مكرر (نُشر سابقاً): {st['duplicates']}\n"
-        f"محجوب (نسائي): {st['womens']}\n"
-        f"فشل: {st['failed']}\n"
-        f"نُشر الآن: {st['posted']}\n"
-        f"الحد الأقصى لكل دورة: {st['max_per_run']}"
-    )
-    if st["last_error"]:
-        msg += "\nآخر خطأ: " + html.escape(st["last_error"])
-    await _reply(update, msg)
 
 
 async def start(update: Update, _ctx: Ctx) -> None:
@@ -177,19 +153,13 @@ async def arabic_router(update: Update, ctx: Ctx) -> None:
 async def _post_init(app: Application) -> None:  # type: ignore[type-arg]
     settings: Settings = app.bot_data["settings"]
     writer: Writer = app.bot_data["writer"]
-    scheduler = AsyncIOScheduler(timezone=fixtures.TZ.key)
-
-    def _on_error(event) -> None:  # type: ignore[no-untyped-def]
-        log.error("Scheduled job failed: %s", event.job_id, exc_info=event.exception)
-
-    scheduler.add_listener(_on_error, EVENT_JOB_ERROR)
+    scheduler = AsyncIOScheduler()
     scheduler.add_job(
         post_news,
         "interval",
         minutes=settings.post_interval_minutes,
         args=[app.bot, settings, writer],
         max_instances=1,
-        next_run_time=datetime.now(fixtures.TZ),  # شغّل فوراً عند الإقلاع
     )
     # منشور مباريات اليوم كل صباح 10:30 بتوقيت المغرب
     scheduler.add_job(
@@ -197,7 +167,7 @@ async def _post_init(app: Application) -> None:  # type: ignore[type-arg]
         "cron",
         hour=10,
         minute=30,
-        timezone=fixtures.TZ.key,
+        timezone=fixtures.TZ,
         args=[app.bot, settings],
         max_instances=1,
         coalesce=True,
@@ -221,7 +191,6 @@ def main() -> None:
     app.add_handler(CommandHandler("injuries", injuries))
     app.add_handler(CommandHandler("transfers", transfers))
     app.add_handler(CommandHandler("today", today))
-    app.add_handler(CommandHandler("post", post_now))
     app.add_handler(MessageHandler(filters.Regex(r"^/[^\sA-Za-z]"), arabic_router))
     app.run_polling()
 
