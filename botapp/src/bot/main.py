@@ -1,5 +1,6 @@
 import html
 import logging
+import os
 from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -167,6 +168,19 @@ async def _post_init(app: Application) -> None:  # type: ignore[type-arg]
         "cron",
         hour=10,
         minute=30,
+        timezone=fixtures.TZ,
+        args=[app.bot, settings],
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
+    # نتائج مباريات اليوم كل مساء 22:00 بتوقيت المغرب (RESULTS_TIME=HH:MM لتغييره)
+    rh, rm = (int(x) for x in os.getenv("RESULTS_TIME", "22:00").split(":"))
+    scheduler.add_job(
+        fixtures.post_todays_results,
+        "cron",
+        hour=rh,
+        minute=rm,
         timezone=fixtures.TZ,
         args=[app.bot, settings],
         max_instances=1,
