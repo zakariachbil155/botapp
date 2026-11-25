@@ -1,5 +1,6 @@
 import html
 import logging
+from types import SimpleNamespace
 
 from sqlalchemy import select
 from telegram import Bot
@@ -62,45 +63,31 @@ async def _publish(bot: Bot, settings: Settings, entry: Entry, text: str) -> Non
     )
 
 
-async def post_news(bot: Bot, settings: Settings, writer: Writer) -> dict:
-    """Scheduled job: rewrite fresh news items and publish them to the channel.
-
-    Returns a stats dict (ignored by the scheduler, shown by the /post command).
-    """
-    stats = {
-        "fetched": 0,
-        "duplicates": 0,
-        "womens": 0,
-        "failed": 0,
-        "posted": 0,
-        "max_per_run": settings.max_posts_per_run,
-        "last_error": "",
-    }
+async def post_news(bot: Bot, settings: Settings, writer: Writer) -> None:
+    """Scheduled job: rewrite fresh news items and publish them to the channel."""
     if not settings.channel_id:
         log.warning("CHANNEL_ID is not set; skipping scheduled posting")
-        stats["last_error"] = "CHANNEL_ID is not set"
-        return stats
+        return
     entries = await fetch_entries(settings.news_feeds)
-    stats["fetched"] = len(entries)
+    posted = 0
     for entry in entries:
-        if stats["posted"] >= settings.max_posts_per_run:
+        if posted >= settings.max_posts_per_run:
             break
         if _already_posted(entry.link):
-            stats["duplicates"] += 1
             continue
         # Skip women's football before spending an AI call on it.
         if is_womens(entry):
-            stats["womens"] += 1
             log.info("Skipping women's football item: %s", entry.title)
             continue
         try:
             text = await writer.rewrite(entry)
+            if not text or is_womens(SimpleNamespace(title=text, summary="", link="")):
+                # Not men's football (or the model refused): never publish, never retry.
+                log.info("Skipping non-football/women's item: %s", entry.title)
+                _mark_posted(entry.link)
+                continue
             await _publish(bot, settings, entry, text)
             _mark_posted(entry.link)
-            stats["posted"] += 1
-        except Exception as e:
-            stats["failed"] += 1
-            stats["last_error"] = repr(e)[:300]
+            posted += 1
+        except Exception:
             log.exception("Failed to post %s", entry.link)
-    log.info("post_news finished: %s", stats)
-    return stats
