@@ -114,6 +114,29 @@ async def today(update: Update, ctx: Ctx) -> None:
         await _reply(update, text)
 
 
+async def today_results(update: Update, ctx: Ctx) -> None:
+    """نتائج اليوم عند الطلب. `/todayresults demo` يعرض معاينة ببيانات وهمية."""
+    now = datetime.now(fixtures.TZ)
+    if getattr(ctx, "args", None) and ctx.args[0].lower() in ("demo", "تجريبي"):
+        await _reply(update, "⚠️ معاينة ببيانات وهمية:")
+        for text in fixtures.demo_results(now):
+            await _reply(update, text)
+        return
+    try:
+        matches = await fixtures.fetch_matches(now, _settings(ctx).football_token)
+    except Exception:
+        log.exception("results request failed")
+        await _reply(update, "تعذّر جلب النتائج الآن، حاول بعد قليل.")
+        return
+    extra = await fixtures.fetch_extra(now)
+    messages = fixtures.build_results_messages(matches, now, extra)
+    if not messages:
+        await _reply(update, "لم تنتهِ أي مباراة مهمة بعد. جرّب /todayresults demo لمعاينة الشكل.")
+        return
+    for text in messages:
+        await _reply(update, text)
+
+
 async def start(update: Update, _ctx: Ctx) -> None:
     await _reply(
         update,
@@ -122,7 +145,8 @@ async def start(update: Update, _ctx: Ctx) -> None:
         "/ترتيب [الدوري] — جدول الترتيب\n"
         "/إصابات — أخبار الإصابات\n"
         "/انتقالات — أخبار الانتقالات\n"
-        "/مباريات — مباريات اليوم\n\n"
+        "/مباريات — مباريات اليوم\n"
+        "/todayresults — نتائج اليوم (demo للمعاينة)\n\n"
         "الدوريات: PL, PD, SA, BL1, FL1",
     )
 
@@ -137,6 +161,7 @@ ARABIC_ROUTES = {
     "انتقالات": transfers,
     "مباريات": today,
     "اليوم": today,
+    "نتائج_اليوم": today_results,
 }
 
 
@@ -205,6 +230,7 @@ def main() -> None:
     app.add_handler(CommandHandler("injuries", injuries))
     app.add_handler(CommandHandler("transfers", transfers))
     app.add_handler(CommandHandler("today", today))
+    app.add_handler(CommandHandler("todayresults", today_results))
     app.add_handler(MessageHandler(filters.Regex(r"^/[^\sA-Za-z]"), arabic_router))
     app.run_polling()
 
