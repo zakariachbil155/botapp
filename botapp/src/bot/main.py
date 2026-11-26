@@ -156,6 +156,8 @@ async def test_cmd(update: Update, ctx: Ctx) -> None:
     elif what in ("scorers", "هدافون"):
         text = summary.build_scorers_message(await summary.collect_scorers(settings.football_token))
         await _reply(update, text or "تعذّر جلب الهدافين الآن.")
+    elif what == "api":
+        await _reply(update, html.escape(await fixtures.api_football_check(now)))
     elif what in ("poll", "استطلاع"):
         raw: list[dict] = []
         try:
@@ -174,7 +176,8 @@ async def test_cmd(update: Update, ctx: Ctx) -> None:
                                    parse_mode=ParseMode.HTML)
     else:
         await _reply(update, "المعاينات (تصلك أنت فقط):\n/test summary — ملخص الليلة\n/test scorers — الهدافون\n"
-                             "/test poll — الاستطلاع\n/test news — شكل الخبر العاجل والأزرار")
+                             "/test poll — الاستطلاع\n/test news — شكل الخبر العاجل والأزرار\n"
+                             "/test api — فحص مفتاح API-Football")
 
 
 async def start(update: Update, _ctx: Ctx) -> None:
