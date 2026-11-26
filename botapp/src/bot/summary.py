@@ -92,21 +92,45 @@ def build_scorers_message(data: dict[str, list[dict]]) -> str:
     return "\n".join(head) + "\n" + "\n\n".join(blocks) + f"\n\n{SEP}\n#الهدافون #كرة_القدم"
 
 
-async def post_weekly_scorers(bot: Bot, settings: Settings) -> None:
-    if not settings.channel_id or not settings.football_token:
-        return
+async def collect_scorers(token: str) -> dict[str, list[dict]]:
+    """يجلب أفضل الهدافين لكل مسابقة (يتجاوز المسابقة التي تفشل)."""
     data: dict[str, list[dict]] = {}
+    if not token:
+        return data
     async with httpx.AsyncClient(timeout=20) as client:
         for code, _ in SCORER_COMPS:
             try:
                 r = await client.get(
                     SCORERS_URL.format(code=code), params={"limit": 5},
-                    headers={"X-Auth-Token": settings.football_token},
+                    headers={"X-Auth-Token": token},
                 )
                 r.raise_for_status()
                 data[code] = r.json().get("scorers", [])
             except Exception as exc:
                 log.warning("scorers %s unavailable (%s)", code, exc)
+    return data
+
+
+# بيانات وهمية للمعاينة الخاصة (/test) فقط، لا تُنشر في القناة أبداً
+DEMO_NEWS = [
+    {"title": "🚨 عاجل ┃ غياب مبابي ستة أسابيع بسبب إصابة في عضلة الفخذ", "link": "https://t.me/"},
+    {"title": "⚽ 🇲🇦 حكيمي يسجل هدفين ويقود المغرب للفوز", "link": "https://t.me/"},
+    {"title": "🔄 ليفربول يقترب من ضم مهاجم جديد", "link": "https://t.me/"},
+]
+
+
+def demo_digest(day: datetime) -> str:
+    results = [
+        f"{fixtures.RLM}🔥 ريال مدريد <b>(2)</b> ⚔️ <b>(1)</b> باريس سان جيرمان",
+        f"{fixtures.RLM}🔥 🇸🇦 الهلال <b>(3)</b> ⚔️ <b>(1)</b> 🇸🇦 النصر",
+    ]
+    return build_digest(DEMO_NEWS, results, day)
+
+
+async def post_weekly_scorers(bot: Bot, settings: Settings) -> None:
+    if not settings.channel_id or not settings.football_token:
+        return
+    data = await collect_scorers(settings.football_token)
     text = build_scorers_message(data)
     if text:
         await bot.send_message(
