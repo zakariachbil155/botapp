@@ -17,6 +17,7 @@ from telegram.ext import (
 from src.bot import extras, fixtures, football, summary
 from src.bot.config import Settings, load_settings
 from src.bot.feeds import INJURY_WORDS, TRANSFER_WORDS, fetch_entries
+from src.bot.filters import is_womens
 from src.bot.jobs import post_news
 from src.bot.models import PostedItem  # noqa: F401  (registers the table)
 from src.bot.writer import Writer
@@ -74,15 +75,25 @@ async def _rss_command(update: Update, ctx: Ctx, kind: str) -> None:
         (s.injury_feeds, INJURY_WORDS) if kind == "injuries" else (s.transfer_feeds, TRANSFER_WORDS)
     )
     try:
-        entries = (await fetch_entries(urls, words))[:3]
-        if not entries:
-            await _reply(update, "لا توجد أخبار مطابقة الآن.")
-            return
+        entries = [e for e in await fetch_entries(urls, words) if not is_womens(e)][:6]
+        sent = 0
         for entry in entries:
+            if sent >= 3:
+                break
             text = await writer.rewrite(entry)
-            await _reply(
-                update, f'{html.escape(text)}\n\n<a href="{html.escape(entry.link)}">المصدر</a>'
-            )
+            if not text:  # رفضه النموذج (SKIP: ليس كرة رجال)، فنتجاوزه
+                continue
+            text = extras.decorate(text, entry, extras.is_breaking(entry))
+            if update.message:
+                await update.message.reply_text(
+                    html.escape(text) + extras.signature(s),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=extras.buttons(entry.link, s),
+                    disable_web_page_preview=True,
+                )
+            sent += 1
+        if not sent:
+            await _reply(update, "لا توجد أخبار مطابقة الآن.")
     except Exception:
         log.exception("RSS command failed")
         await _reply(update, "تعذّر جلب الأخبار الآن، حاول بعد قليل.")
@@ -131,7 +142,7 @@ async def today_results(update: Update, ctx: Ctx) -> None:
     extra = await fixtures.fetch_extra(now)
     messages = fixtures.build_results_messages(matches, now, extra)
     if not messages:
-        await _reply(update, "لم تنتهِ أي مباراة مهمة بعد. جرّب /todayresults demo لمعاينة الشكل.")
+        await _reply(update, "لم تنتهِ أي مباراة مهمة بعد. جرّب /todayresults_demo لمعاينة الشكل.")
         return
     for text in messages:
         await _reply(update, text)
@@ -175,9 +186,17 @@ async def test_cmd(update: Update, ctx: Ctx) -> None:
         await ctx.bot.send_message(chat_id=chat_id, text=text, reply_markup=extras.buttons("https://t.me/", settings),
                                    parse_mode=ParseMode.HTML)
     else:
-        await _reply(update, "المعاينات (تصلك أنت فقط):\n/test summary — ملخص الليلة\n/test scorers — الهدافون\n"
-                             "/test poll — الاستطلاع\n/test news — شكل الخبر العاجل والأزرار\n"
-                             "/test api — فحص مفتاح API-Football")
+        await _reply(update, "المعاينات (تصلك أنت فقط):\n/test_summary — ملخص الليلة\n/test_scorers — الهدافون\n"
+                             "/test_poll — الاستطلاع\n/test_news — شكل الخبر العاجل والأزرار\n"
+                             "/test_api — فحص مفتاح API-Football")
+
+
+def _alias(handler, arg: str):
+    """يحوّل /test_api إلى /test api (نفس المعالج مع وسيط ثابت)."""
+    async def run(update: Update, ctx: Ctx) -> None:
+        ctx.args = [arg]
+        await handler(update, ctx)
+    return run
 
 
 async def start(update: Update, _ctx: Ctx) -> None:
@@ -189,7 +208,7 @@ async def start(update: Update, _ctx: Ctx) -> None:
         "/إصابات — أخبار الإصابات\n"
         "/انتقالات — أخبار الانتقالات\n"
         "/مباريات — مباريات اليوم\n"
-        "/todayresults — نتائج اليوم (demo للمعاينة)\n\n"
+        "/todayresults — نتائج اليوم\n/todayresults_demo — معاينة شكل النتائج\n\n"
         "الدوريات: PL, PD, SA, BL1, FL1",
     )
 
@@ -267,6 +286,13 @@ def main() -> None:
     app.add_handler(CommandHandler("today", today))
     app.add_handler(CommandHandler("todayresults", today_results))
     app.add_handler(CommandHandler("test", test_cmd))
+    # تيليغرام يعدّ الشرطة السفلية جزءًا من اسم الأمر، فندعم /test_api وأخواتها أيضًا
+    for name, handler, arg in [
+        ("test_summary", test_cmd, "summary"), ("test_scorers", test_cmd, "scorers"),
+        ("test_poll", test_cmd, "poll"), ("test_news", test_cmd, "news"), ("test_api", test_cmd, "api"),
+        ("todayresults_demo", today_results, "demo"),
+    ]:
+        app.add_handler(CommandHandler(name, _alias(handler, arg)))
     app.add_handler(MessageHandler(filters.Regex(r"^/[^\sA-Za-z]"), arabic_router))
     app.run_polling()
 
