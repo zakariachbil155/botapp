@@ -1,5 +1,6 @@
 import html
 import logging
+from types import SimpleNamespace
 from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -136,6 +137,46 @@ async def today_results(update: Update, ctx: Ctx) -> None:
         await _reply(update, text)
 
 
+async def test_cmd(update: Update, ctx: Ctx) -> None:
+    """معاينة خاصة بك فقط (لا شيء يُنشر في القناة): /test summary|scorers|poll|news."""
+    what = (ctx.args[0].lower() if getattr(ctx, "args", None) else "")
+    settings, now = _settings(ctx), datetime.now(fixtures.TZ)
+    chat_id = update.effective_chat.id
+    if what in ("summary", "ملخص"):
+        news = extras.top_news(5)
+        try:
+            matches = await fixtures.fetch_matches(now, settings.football_token)
+        except Exception:
+            matches = []
+        res = fixtures.top_results_lines(matches, now, await fixtures.fetch_extra(now), 5)
+        if news or res:
+            await _reply(update, summary.build_digest(news, res, now))
+        else:
+            await _reply(update, "⚠️ معاينة ببيانات وهمية (لا محتوى حقيقي اليوم بعد):\n\n" + summary.demo_digest(now))
+    elif what in ("scorers", "هدافون"):
+        text = summary.build_scorers_message(await summary.collect_scorers(settings.football_token))
+        await _reply(update, text or "تعذّر جلب الهدافين الآن.")
+    elif what in ("poll", "استطلاع"):
+        raw: list[dict] = []
+        try:
+            fixtures._collect(await fixtures.fetch_matches(now, settings.football_token),
+                              await fixtures.fetch_extra(now), now, raw=raw)
+        except Exception:
+            log.exception("poll preview failed")
+        big = [m for m in raw if m["both_big"]]
+        m = big[0] if big else {"home": "ريال مدريد", "away": "باريس سان جيرمان", "kick": now}
+        await ctx.bot.send_poll(chat_id=chat_id, **fixtures.poll_payload(m))
+    elif what in ("news", "خبر"):
+        entry = SimpleNamespace(title="Real Madrid star Mbappe ruled out for six weeks", summary="", link="https://t.me/")
+        text = "🏥 غياب مبابي ستة أسابيع\n\nأعلن ريال مدريد غياب مبابي بسبب إصابة في عضلة الفخذ.\n\n📌 التفاصيل:\n• المدة: ستة أسابيع\n\n#ريال_مدريد #مبابي"
+        text = extras.decorate(text, entry, extras.is_breaking(entry)) + extras.signature(settings)
+        await ctx.bot.send_message(chat_id=chat_id, text=text, reply_markup=extras.buttons("https://t.me/", settings),
+                                   parse_mode=ParseMode.HTML)
+    else:
+        await _reply(update, "المعاينات (تصلك أنت فقط):\n/test summary — ملخص الليلة\n/test scorers — الهدافون\n"
+                             "/test poll — الاستطلاع\n/test news — شكل الخبر العاجل والأزرار")
+
+
 async def start(update: Update, _ctx: Ctx) -> None:
     await _reply(
         update,
@@ -161,6 +202,7 @@ ARABIC_ROUTES = {
     "مباريات": today,
     "اليوم": today,
     "نتائج_اليوم": today_results,
+    "تجربة": test_cmd,
 }
 
 
@@ -221,6 +263,7 @@ def main() -> None:
     app.add_handler(CommandHandler("transfers", transfers))
     app.add_handler(CommandHandler("today", today))
     app.add_handler(CommandHandler("todayresults", today_results))
+    app.add_handler(CommandHandler("test", test_cmd))
     app.add_handler(MessageHandler(filters.Regex(r"^/[^\sA-Za-z]"), arabic_router))
     app.run_polling()
 
