@@ -48,6 +48,10 @@ COMP_ORDER = ["CL", "WC", "EC", "PL", "PD", "SA", "BL1", "FL1"]
 
 # مصدر إضافي مجاني للدوريات العربية والمنتخبات (اسم الدوري عند المصدر -> عنوان عربي)
 EXTRA_URL = "https://www.thesportsdb.com/api/v1/json/3/eventsday.php"
+EXTRA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; FootballNewsBot/1.0)",
+    "Accept": "application/json",
+}
 EXTRA_LEAGUES = {
     "saudi pro league": "🇸🇦 دوري روشن السعودي",
     "saudi professional league": "🇸🇦 دوري روشن السعودي",
@@ -232,9 +236,9 @@ async def fetch_matches(
 
 
 async def fetch_extra(day: datetime, client: httpx.AsyncClient | None = None) -> list[dict]:
-    """مباريات الدوريات العربية والمنتخبات من TheSportsDB. أي فشل يعيد قائمة فارغة."""
+    """مباريات الدوريات العربية والمنتخبات من TheSportsDB. أي فشل يعيد قائمة فارغة بلا ضجيج."""
     own = client is None
-    client = client or httpx.AsyncClient(timeout=20)
+    client = client or httpx.AsyncClient(timeout=20, headers=EXTRA_HEADERS, follow_redirects=True)
     out: list[dict] = []
     try:
         for delta in (-1, 0, 1):
@@ -243,8 +247,10 @@ async def fetch_extra(day: datetime, client: httpx.AsyncClient | None = None) ->
                 r = await client.get(EXTRA_URL, params={"d": d, "s": "Soccer"})
                 r.raise_for_status()
                 out.extend(r.json().get("events") or [])
-            except Exception:
-                log.warning("extra fixtures source failed for %s", d, exc_info=True)
+            except Exception as exc:
+                # نكتفي بسطر واحد (بلا Traceback) ونتوقف: المصدر الأول يكفي
+                log.warning("extra fixtures source unavailable (%s); skipping it", exc)
+                break
     finally:
         if own:
             await client.aclose()
