@@ -1,6 +1,5 @@
 import html
 import logging
-import os
 from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -14,7 +13,7 @@ from telegram.ext import (
     filters,
 )
 
-from src.bot import fixtures, football
+from src.bot import extras, fixtures, football, summary
 from src.bot.config import Settings, load_settings
 from src.bot.feeds import INJURY_WORDS, TRANSFER_WORDS, fetch_entries
 from src.bot.jobs import post_news
@@ -187,37 +186,22 @@ async def _post_init(app: Application) -> None:  # type: ignore[type-arg]
         args=[app.bot, settings, writer],
         max_instances=1,
     )
-    # منشور مباريات اليوم كل صباح 10:30 بتوقيت المغرب
-    scheduler.add_job(
-        fixtures.post_todays_fixtures,
-        "cron",
-        hour=10,
-        minute=30,
-        timezone=fixtures.TZ,
-        args=[app.bot, settings],
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=3600,
-    )
-    # نتائج مباريات اليوم كل مساء 22:00 بتوقيت المغرب (RESULTS_TIME=HH:MM لتغييره)
-    try:
-        rh, rm = (int(x) for x in (os.getenv("RESULTS_TIME") or "22:00").strip().split(":"))
-        if not (0 <= rh <= 23 and 0 <= rm <= 59):
-            raise ValueError
-    except ValueError:
-        log.warning("Invalid RESULTS_TIME; falling back to 22:00")
-        rh, rm = 22, 0
-    scheduler.add_job(
-        fixtures.post_todays_results,
-        "cron",
-        hour=rh,
-        minute=rm,
-        timezone=fixtures.TZ,
-        args=[app.bot, settings],
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=3600,
-    )
+    args = [app.bot, settings]
+
+    def cron(func, env: str, default: str, **extra) -> None:
+        hour, minute = extras.parse_hm(env, default)
+        scheduler.add_job(
+            func, "cron", hour=hour, minute=minute, timezone=fixtures.TZ, args=args,
+            max_instances=1, coalesce=True, misfire_grace_time=3600, **extra,
+        )
+
+    # كل الأوقات بتوقيت المغرب، ويمكن تغيير كل واحد بمتغير بيئة HH:MM
+    cron(fixtures.post_todays_fixtures, "FIXTURES_TIME", "10:30")   # مباريات اليوم + تثبيت
+    cron(fixtures.post_polls, "POLLS_TIME", "12:30")                # استطلاع «من سيفوز؟»
+    cron(fixtures.post_todays_results, "RESULTS_TIME", "22:00")     # نتائج اليوم
+    cron(summary.post_nightly_summary, "SUMMARY_TIME", "23:00")     # ملخص الليلة
+    cron(fixtures.unpin_fixtures, "UNPIN_TIME", "23:55")            # إلغاء التثبيت
+    cron(summary.post_weekly_scorers, "SCORERS_TIME", "12:00", day_of_week="mon")  # الهدافون
     scheduler.start()
     app.bot_data["scheduler"] = scheduler
 
