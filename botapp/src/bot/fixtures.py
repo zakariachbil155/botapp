@@ -12,6 +12,7 @@ import html
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -236,8 +237,128 @@ async def fetch_matches(
             await client.aclose()
 
 
+API_FOOTBALL_URL = "https://v3.football.api-sports.io/fixtures"
+_AF_CACHE: dict = {}
+_AF_TABLE = [
+    ("caf champions league", "caf champions league"),
+    ("caf confederation", "caf confederation cup"),
+    ("africa cup of nations", "africa cup of nations"),
+    ("afc champions league", "afc champions league elite"),
+    ("arab cup", "arab cup"),
+    ("world cup - qualification", "world cup qualifying"),
+    ("uefa nations league", "uefa nations league"),
+    ("euro championship - qualification", "uefa european championship qualifying"),
+]
+_AF_SKIP = {"PST", "CANC", "ABD", "AWD", "WO", "SUSP"}
+
+
+def _af_league_key(league: dict) -> str | None:
+    """يحوّل مسابقة API-Football إلى مفتاح EXTRA_LEAGUES (أو None إن لم تكن مطلوبة)."""
+    name = (league.get("name") or "").lower().strip()
+    country = (league.get("country") or "").lower()
+    if country == "saudi-arabia" and name == "pro league":
+        return "saudi pro league"
+    if country == "egypt" and name == "premier league":
+        return "egyptian premier league"
+    if country == "morocco" and "botola" in name:
+        return "botola pro"
+    if country == "algeria" and name == "ligue 1":
+        return "algerian ligue professionnelle 1"
+    if country == "tunisia" and name == "ligue 1":
+        return "tunisian ligue professionnelle 1"
+    if name == "friendlies":
+        return "international friendlies"
+    return next((v for k, v in _AF_TABLE if k in name), None)
+
+
+def _af_events(payload: dict) -> list[dict]:
+    """يحوّل رد API-Football إلى الشكل الموحد الذي يقرؤه _collect."""
+    out: list[dict] = []
+    for it in payload.get("response") or []:
+        league = it.get("league") or {}
+        key = _af_league_key(league)
+        if not key or re.search(r"women|femin", league.get("name") or "", re.I):
+            continue
+        fx, teams, goals = it.get("fixture") or {}, it.get("teams") or {}, it.get("goals") or {}
+        short = (fx.get("status") or {}).get("short", "")
+        if short in _AF_SKIP:
+            continue
+        try:
+            dt = datetime.fromisoformat(fx["date"]).astimezone(ZoneInfo("UTC"))
+        except (KeyError, ValueError):
+            continue
+        out.append({
+            "strLeague": key,
+            "strHomeTeam": (teams.get("home") or {}).get("name", ""),
+            "strAwayTeam": (teams.get("away") or {}).get("name", ""),
+            "strTimestamp": dt.strftime("%Y-%m-%dT%H:%M:%S"),
+            "intHomeScore": goals.get("home"),
+            "intAwayScore": goals.get("away"),
+            "strStatus": "Match Finished" if short in ("FT", "AET", "PEN") else short,
+        })
+    return out
+
+
+async def _fetch_api_football(day: datetime, key: str, client: httpx.AsyncClient | None = None):
+    """يعيد قائمة الأحداث، أو None إن رفض الحساب الطلب (مثلاً الموسم غير مشمول بالخطة)."""
+    d = day.strftime("%Y-%m-%d")
+    hit = _AF_CACHE.get(d)
+    if hit and time.time() - hit[0] < 600:  # ذاكرة 10 دقائق لتوفير حصة الـ100 طلب
+        return hit[1]
+    own = client is None
+    client = client or httpx.AsyncClient(timeout=20)
+    try:
+        r = await client.get(
+            API_FOOTBALL_URL, params={"date": d, "timezone": TZ.key}, headers={"x-apisports-key": key}
+        )
+        r.raise_for_status()
+        payload = r.json()
+    finally:
+        if own:
+            await client.aclose()
+    if payload.get("errors"):
+        log.warning("API-Football refused the request: %s", payload["errors"])
+        return None
+    events = _af_events(payload)
+    _AF_CACHE[d] = (time.time(), events)
+    return events
+
+
+async def api_football_check(day: datetime) -> str:
+    """تشخيص للأمر /test api: هل المفتاح يعمل وهل الموسم الحالي مشمول؟"""
+    key = os.getenv("API_FOOTBALL_KEY", "").strip()
+    if not key:
+        return "API_FOOTBALL_KEY غير مضبوط في Railway."
+    d = day.strftime("%Y-%m-%d")
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get(API_FOOTBALL_URL, params={"date": d, "timezone": TZ.key},
+                            headers={"x-apisports-key": key})
+        r.raise_for_status()
+        payload = r.json()
+    except Exception as exc:
+        return f"تعذّر الاتصال بـ API-Football: {exc}"
+    if payload.get("errors"):
+        return f"رفض الحساب الطلب: {payload['errors']}"
+    total = len(payload.get("response") or [])
+    mine = _af_events(payload)
+    names = sorted({e["strLeague"] for e in mine})
+    left = r.headers.get("x-ratelimit-requests-remaining", "؟")
+    return (f"✅ المفتاح يعمل لتاريخ {d}.\nمباريات اليوم عالميًا: {total}\n"
+            f"من المسابقات المطلوبة: {len(mine)} ({', '.join(names) or 'لا شيء'})\nالطلبات المتبقية اليوم: {left}")
+
+
 async def fetch_extra(day: datetime, client: httpx.AsyncClient | None = None) -> list[dict]:
-    """مباريات الدوريات العربية والمنتخبات من TheSportsDB. أي فشل يعيد قائمة فارغة بلا ضجيج."""
+    """مباريات الدوريات العربية والمنتخبات: API-Football إن وُجد مفتاح، وإلا TheSportsDB.
+    أي فشل يعيد قائمة فارغة بلا ضجيج."""
+    key = os.getenv("API_FOOTBALL_KEY", "").strip()
+    if key:
+        try:
+            events = await _fetch_api_football(day, key)
+            if events is not None:
+                return events
+        except Exception as exc:
+            log.warning("API-Football unavailable (%s); falling back", exc)
     own = client is None
     client = client or httpx.AsyncClient(timeout=20, headers=EXTRA_HEADERS, follow_redirects=True)
     out: list[dict] = []
