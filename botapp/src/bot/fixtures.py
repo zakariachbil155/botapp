@@ -1,301 +1,670 @@
+"""منشور مباريات اليوم (يُرسل كل صباح 10:30 بتوقيت المغرب).
+
+المصدر: football-data.org (الخطة المجانية). تغطي: الدوري الإنجليزي والإسباني والإيطالي
+والألماني والفرنسي، ودوري أبطال أوروبا، وكأس العالم، وأمم أوروبا.
+للدوريات العربية والإفريقية والمنتخبات (ودية/تصفيات) يُستعمل مصدر مجاني إضافي (TheSportsDB)
+بأفضل جهد: إن فشل يُكتفى بالمصدر الأول دون أي خطأ.
+
+المفتاح: settings.football_token (نفسه المستعمل في /results و/table).
+متغير البيئة TIMEZONE اختياري، الافتراضي Africa/Casablanca.
+"""
 import html
 import logging
-from types import SimpleNamespace
-from datetime import datetime
+import os
+import re
+import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import Update
+import httpx
+from telegram import Bot
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
 
-from src.bot import extras, fixtures, football, summary
-from src.bot.config import Settings, load_settings
-from src.bot.feeds import INJURY_WORDS, TRANSFER_WORDS, fetch_entries
-from src.bot.filters import is_womens
-from src.bot.jobs import post_news
-from src.bot.models import PostedItem  # noqa: F401  (registers the table)
-from src.bot.writer import Writer
-from src.db.session import Base, engine
+from src.bot import extras
+from src.bot.config import Settings
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-log = logging.getLogger("bot")
+log = logging.getLogger(__name__)
 
-Ctx = ContextTypes.DEFAULT_TYPE
+API_URL = "https://api.football-data.org/v4/matches"
+TZ = ZoneInfo(os.getenv("TIMEZONE", "Africa/Casablanca"))
+MESSAGE_MAX = 3800
 
+# رموز مسابقات الخطة المجانية
+COMPETITIONS = "PL,PD,SA,BL1,FL1,CL,WC,EC"
+# مسابقات تُنشر كل مبارياتها، وغيرها لا يُنشر إلا إذا كان فيه نادٍ كبير
+ALWAYS = {"CL", "WC", "EC"}
+SKIP_STATUS = {"CANCELLED", "POSTPONED", "SUSPENDED"}
+FINISHED_WORDS = {"match finished", "ft", "finished", "aet", "after extra time", "pen", "after penalties", "aot"}
 
-def _settings(ctx: Ctx) -> Settings:
-    settings: Settings = ctx.bot_data["settings"]
-    return settings
-
-
-async def _reply(update: Update, text: str) -> None:
-    if update.message:
-        await update.message.reply_text(
-            text, parse_mode=ParseMode.HTML, disable_web_page_preview=True
-        )
-
-
-async def _league_command(update: Update, ctx: Ctx, kind: str) -> None:
-    code = football.normalize_league(ctx.args[0] if ctx.args else None)
-    if code is None:
-        await _reply(update, "رمز الدوري غير معروف. المتاح: " + ", ".join(football.LEAGUES))
-        return
-    token = _settings(ctx).football_token
-    try:
-        text = (
-            await football.standings_text(token, code)
-            if kind == "table"
-            else await football.results_text(token, code)
-        )
-    except Exception:
-        log.exception("football-data request failed")
-        await _reply(update, "تعذّر جلب البيانات الآن، حاول بعد قليل.")
-        return
-    await _reply(update, text)
-
-
-async def results(update: Update, ctx: Ctx) -> None:
-    await _league_command(update, ctx, "results")
-
-
-async def table(update: Update, ctx: Ctx) -> None:
-    await _league_command(update, ctx, "table")
-
-
-async def _rss_command(update: Update, ctx: Ctx, kind: str) -> None:
-    s = _settings(ctx)
-    writer: Writer = ctx.bot_data["writer"]
-    urls, words = (
-        (s.injury_feeds, INJURY_WORDS) if kind == "injuries" else (s.transfer_feeds, TRANSFER_WORDS)
-    )
-    try:
-        entries = [e for e in await fetch_entries(urls, words) if not is_womens(e)][:6]
-        sent = 0
-        for entry in entries:
-            if sent >= 3:
-                break
-            text = await writer.rewrite(entry)
-            if not text:  # رفضه النموذج (SKIP: ليس كرة رجال)، فنتجاوزه
-                continue
-            text = extras.decorate(text, entry, extras.is_breaking(entry))
-            if update.message:
-                await update.message.reply_text(
-                    html.escape(text) + extras.signature(s),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=extras.buttons(entry.link, s),
-                    disable_web_page_preview=True,
-                )
-            sent += 1
-        if not sent:
-            await _reply(update, "لا توجد أخبار مطابقة الآن.")
-    except Exception:
-        log.exception("RSS command failed")
-        await _reply(update, "تعذّر جلب الأخبار الآن، حاول بعد قليل.")
-
-
-async def injuries(update: Update, ctx: Ctx) -> None:
-    await _rss_command(update, ctx, "injuries")
-
-
-async def transfers(update: Update, ctx: Ctx) -> None:
-    await _rss_command(update, ctx, "transfers")
-
-
-async def today(update: Update, ctx: Ctx) -> None:
-    """مباريات اليوم عند الطلب (نفس قائمة منشور 10:30)."""
-    now = datetime.now(fixtures.TZ)
-    try:
-        matches = await fixtures.fetch_matches(now, _settings(ctx).football_token)
-    except Exception:
-        log.exception("fixtures request failed")
-        await _reply(update, "تعذّر جلب المباريات الآن، حاول بعد قليل.")
-        return
-    extra = await fixtures.fetch_extra(now)
-    messages = fixtures.build_messages(matches, now, extra)
-    if not messages:
-        await _reply(update, "لا توجد مباريات مهمة اليوم.")
-        return
-    for text in messages:
-        await _reply(update, text)
-
-
-async def today_results(update: Update, ctx: Ctx) -> None:
-    """نتائج اليوم عند الطلب. `/todayresults demo` يعرض معاينة ببيانات وهمية."""
-    now = datetime.now(fixtures.TZ)
-    if getattr(ctx, "args", None) and ctx.args[0].lower() in ("demo", "تجريبي"):
-        await _reply(update, "⚠️ معاينة ببيانات وهمية:")
-        for text in fixtures.demo_results(now):
-            await _reply(update, text)
-        return
-    try:
-        matches = await fixtures.fetch_matches(now, _settings(ctx).football_token)
-    except Exception:
-        log.exception("results request failed")
-        await _reply(update, "تعذّر جلب النتائج الآن، حاول بعد قليل.")
-        return
-    extra = await fixtures.fetch_extra(now)
-    messages = fixtures.build_results_messages(matches, now, extra)
-    if not messages:
-        await _reply(update, "لم تنتهِ أي مباراة مهمة بعد. جرّب /todayresults demo لمعاينة الشكل.")
-        return
-    for text in messages:
-        await _reply(update, text)
-
-
-async def test_cmd(update: Update, ctx: Ctx) -> None:
-    """معاينة خاصة بك فقط (لا شيء يُنشر في القناة): /test summary|scorers|poll|news."""
-    what = (ctx.args[0].lower() if getattr(ctx, "args", None) else "")
-    settings, now = _settings(ctx), datetime.now(fixtures.TZ)
-    chat_id = update.effective_chat.id
-    if what in ("summary", "ملخص"):
-        news = extras.top_news(5)
-        try:
-            matches = await fixtures.fetch_matches(now, settings.football_token)
-        except Exception:
-            matches = []
-        res = fixtures.top_results_lines(matches, now, await fixtures.fetch_extra(now), 5)
-        if news or res:
-            await _reply(update, summary.build_digest(news, res, now))
-        else:
-            await _reply(update, "⚠️ معاينة ببيانات وهمية (لا محتوى حقيقي اليوم بعد):\n\n" + summary.demo_digest(now))
-    elif what in ("scorers", "هدافون"):
-        text = summary.build_scorers_message(await summary.collect_scorers(settings.football_token))
-        await _reply(update, text or "تعذّر جلب الهدافين الآن.")
-    elif what == "api":
-        await _reply(update, html.escape(await fixtures.api_football_check(now)))
-    elif what in ("poll", "استطلاع"):
-        raw: list[dict] = []
-        try:
-            fixtures._collect(await fixtures.fetch_matches(now, settings.football_token),
-                              await fixtures.fetch_extra(now), now, raw=raw)
-        except Exception:
-            log.exception("poll preview failed")
-        big = [m for m in raw if m["both_big"]]
-        m = big[0] if big else {"home": "ريال مدريد", "away": "باريس سان جيرمان", "kick": now}
-        await ctx.bot.send_poll(chat_id=chat_id, **fixtures.poll_payload(m))
-    elif what in ("news", "خبر"):
-        entry = SimpleNamespace(title="Real Madrid star Mbappe ruled out for six weeks", summary="", link="https://t.me/")
-        text = "🏥 غياب مبابي ستة أسابيع\n\nأعلن ريال مدريد غياب مبابي بسبب إصابة في عضلة الفخذ.\n\n📌 التفاصيل:\n• المدة: ستة أسابيع\n\n#ريال_مدريد #مبابي"
-        text = extras.decorate(text, entry, extras.is_breaking(entry)) + extras.signature(settings)
-        await ctx.bot.send_message(chat_id=chat_id, text=text, reply_markup=extras.buttons("https://t.me/", settings),
-                                   parse_mode=ParseMode.HTML)
-    else:
-        await _reply(update, "المعاينات (تصلك أنت فقط):\n/test summary — ملخص الليلة\n/test scorers — الهدافون\n"
-                             "/test poll — الاستطلاع\n/test news — شكل الخبر العاجل والأزرار\n"
-                             "/test api — فحص مفتاح API-Football")
-
-
-def _alias(handler, arg: str):
-    """يحوّل /test_api إلى /test api (نفس المعالج مع وسيط ثابت)."""
-    async def run(update: Update, ctx: Ctx) -> None:
-        ctx.args = [arg]
-        await handler(update, ctx)
-    return run
-
-
-async def start(update: Update, _ctx: Ctx) -> None:
-    await _reply(
-        update,
-        "أهلاً! الأوامر المتاحة:\n"
-        "/نتائج [الدوري] — آخر النتائج\n"
-        "/ترتيب [الدوري] — جدول الترتيب\n"
-        "/إصابات — أخبار الإصابات\n"
-        "/انتقالات — أخبار الانتقالات\n"
-        "/مباريات — مباريات اليوم\n"
-        "/todayresults — نتائج اليوم (demo للمعاينة)\n\n"
-        "الدوريات: PL, PD, SA, BL1, FL1",
-    )
-
-
-# Telegram only treats Latin letters as bot commands, so Arabic commands
-# like "/نتائج" arrive as plain text and are routed manually.
-ARABIC_ROUTES = {
-    "نتائج": results,
-    "ترتيب": table,
-    "إصابات": injuries,
-    "اصابات": injuries,
-    "انتقالات": transfers,
-    "مباريات": today,
-    "اليوم": today,
-    "نتائج_اليوم": today_results,
-    "تجربة": test_cmd,
+COMP_AR = {
+    "PL": "🏴 الدوري الإنجليزي الممتاز",
+    "PD": "🇪🇸 الدوري الإسباني",
+    "SA": "🇮🇹 الدوري الإيطالي",
+    "BL1": "🇩🇪 الدوري الألماني",
+    "FL1": "🇫🇷 الدوري الفرنسي",
+    "CL": "🏆 دوري أبطال أوروبا",
+    "WC": "🌍 كأس العالم",
+    "EC": "🇪🇺 كأس أمم أوروبا",
 }
+COMP_ORDER = ["CL", "WC", "EC", "PL", "PD", "SA", "BL1", "FL1"]
+
+# مصدر إضافي مجاني للدوريات العربية والمنتخبات (اسم الدوري عند المصدر -> عنوان عربي)
+EXTRA_URL = "https://www.thesportsdb.com/api/v1/json/3/eventsday.php"
+EXTRA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; FootballNewsBot/1.0)",
+    "Accept": "application/json",
+}
+EXTRA_LEAGUES = {
+    "saudi pro league": "🇸🇦 دوري روشن السعودي",
+    "saudi professional league": "🇸🇦 دوري روشن السعودي",
+    "egyptian premier league": "🇪🇬 الدوري المصري",
+    "moroccan botola pro": "🇲🇦 البطولة الاحترافية المغربية",
+    "botola pro": "🇲🇦 البطولة الاحترافية المغربية",
+    "algerian ligue professionnelle 1": "🇩🇿 الدوري الجزائري",
+    "tunisian ligue professionnelle 1": "🇹🇳 الدوري التونسي",
+    "caf champions league": "🌍 دوري أبطال إفريقيا",
+    "caf confederation cup": "🌍 كأس الكونفدرالية الإفريقية",
+    "afc champions league elite": "🌏 دوري أبطال آسيا",
+    "arab cup": "🏆 كأس العرب",
+    "africa cup of nations": "🏆 كأس أمم إفريقيا",
+    "international friendlies": "🤝 مباريات ودية دولية",
+    "friendlies": "🤝 مباريات ودية دولية",
+    "fifa world cup qualifying": "🌍 تصفيات كأس العالم",
+    "world cup qualifying": "🌍 تصفيات كأس العالم",
+    "uefa nations league": "🇪🇺 دوري الأمم الأوروبية",
+    "uefa european championship qualifying": "🇪🇺 تصفيات أمم أوروبا",
+}
+EXTRA_ORDER = ["🌍", "🏆", "🤝", "🇪🇺", "🇸🇦", "🇪🇬", "🇲🇦", "🇩🇿", "🇹🇳", "🌏"]
+
+# (مفتاح إنجليزي بحروف صغيرة، الاسم العربي، مهم؟، علم المنتخب أو "")
+# الترتيب مهم: الأطول والأخص أولاً.
+TEAMS = [
+    # إسبانيا
+    ("real madrid", "ريال مدريد", True, ""), ("barcelona", "برشلونة", True, ""),
+    ("atlético", "أتلتيكو مدريد", True, ""), ("atletico", "أتلتيكو مدريد", True, ""),
+    ("sevilla", "إشبيلية", False, ""), ("real sociedad", "ريال سوسيداد", False, ""),
+    ("villarreal", "فياريال", False, ""), ("athletic", "أتلتيك بيلباو", False, ""),
+    ("valencia", "فالنسيا", False, ""), ("betis", "ريال بيتيس", False, ""),
+    ("girona", "جيرونا", False, ""),
+    # إنجلترا
+    ("manchester city", "مانشستر سيتي", True, ""), ("manchester united", "مانشستر يونايتد", True, ""),
+    ("liverpool", "ليفربول", True, ""), ("arsenal", "أرسنال", True, ""), ("chelsea", "تشيلسي", True, ""),
+    ("tottenham", "توتنهام", True, ""), ("newcastle", "نيوكاسل", False, ""),
+    ("aston villa", "أستون فيلا", False, ""), ("west ham", "وست هام", False, ""),
+    ("brighton", "برايتون", False, ""), ("everton", "إيفرتون", False, ""),
+    ("crystal palace", "كريستال بالاس", False, ""), ("fulham", "فولهام", False, ""),
+    # إيطاليا
+    ("juventus", "يوفنتوس", True, ""), ("internazionale", "إنتر ميلان", True, ""),
+    ("inter milan", "إنتر ميلان", True, ""), ("ac milan", "ميلان", True, ""),
+    ("napoli", "نابولي", True, ""), ("roma", "روما", False, ""), ("lazio", "لاتسيو", False, ""),
+    ("atalanta", "أتالانتا", False, ""), ("fiorentina", "فيورنتينا", False, ""),
+    ("como", "كومو", False, ""), ("bologna", "بولونيا", False, ""),
+    # ألمانيا
+    ("bayern", "بايرن ميونخ", True, ""), ("dortmund", "بوروسيا دورتموند", True, ""),
+    ("leverkusen", "باير ليفركوزن", True, ""), ("leipzig", "لايبزيغ", False, ""),
+    ("frankfurt", "آينتراخت فرانكفورت", False, ""), ("stuttgart", "شتوتغارت", False, ""),
+    # فرنسا
+    ("paris saint", "باريس سان جيرمان", True, ""), ("paris sg", "باريس سان جيرمان", True, ""),
+    ("marseille", "مارسيليا", True, ""), ("monaco", "موناكو", True, ""),
+    ("lyonnais", "ليون", False, ""), ("lyon", "ليون", False, ""), ("lille", "ليل", False, ""),
+    ("nice", "نيس", False, ""), ("lens", "لانس", False, ""),
+    # أوروبا
+    ("benfica", "بنفيكا", True, ""), ("porto", "بورتو", True, ""),
+    ("sporting", "سبورتينغ لشبونة", True, ""), ("ajax", "أياكس", True, ""),
+    ("psv", "آيندهوفن", False, ""), ("feyenoord", "فينورد", False, ""),
+    ("galatasaray", "غلطة سراي", True, ""), ("fenerbahçe", "فنربخشة", True, ""),
+    ("fenerbahce", "فنربخشة", True, ""), ("besiktas", "بشكتاش", False, ""),
+    ("celtic", "سيلتيك", True, ""), ("rangers", "رينجرز", False, ""),
+    ("club brugge", "كلوب بروج", False, ""), ("olympiacos", "أولمبياكوس", False, ""),
+    ("shakhtar", "شاختار دونيتسك", False, ""), ("red star", "النجم الأحمر", False, ""),
+    ("crvena zvezda", "النجم الأحمر", False, ""), ("salzburg", "سالزبورغ", False, ""),
+    ("bodø/glimt", "بودو غليمت", False, ""), ("bodo/glimt", "بودو غليمت", False, ""),
+    ("pae aek", "إيه إي كيه أثينا", False, ""), ("aek athens", "إيه إي كيه أثينا", False, ""),
+    ("slovan", "سلوفان براتيسلافا", False, ""), ("lask", "لاسك", False, ""),
+    ("slavia praha", "سلافيا براغ", False, ""), ("sparta praha", "سبارتا براغ", False, ""),
+    ("sabah", "صباح", False, ""), ("viking", "فايكينغ", False, ""),
+    ("qarabag", "قره باغ", False, ""), ("qarabağ", "قره باغ", False, ""),
+    ("pafos", "بافوس", False, ""), ("kairat", "كايرات ألماتي", False, ""),
+    ("copenhagen", "كوبنهاغن", False, ""), ("union saint", "يونيون سان جيلواز", False, ""),
+    ("young boys", "يانغ بويز", False, ""), ("dinamo zagreb", "دينامو زغرب", False, ""),
+    ("braga", "براغا", False, ""), ("ferencv", "فيرينتسفاروش", False, ""),
+    ("maccabi tel aviv", "مكابي تل أبيب", False, ""), ("panathinaikos", "باناثينايكوس", False, ""),
+    ("paok", "باوك", False, ""), ("rb salzburg", "ريد بول سالزبورغ", False, ""),
+    # أندية سعودية
+    ("al-hilal", "الهلال", True, "🇸🇦"), ("al hilal", "الهلال", True, "🇸🇦"),
+    ("al-nassr", "النصر", True, "🇸🇦"), ("al nassr", "النصر", True, "🇸🇦"),
+    ("al-ittihad", "الاتحاد", True, "🇸🇦"), ("al ittihad", "الاتحاد", True, "🇸🇦"),
+    ("al-ahli saudi", "الأهلي السعودي", True, "🇸🇦"), ("al-ahli jeddah", "الأهلي السعودي", True, "🇸🇦"),
+    ("al-shabab", "الشباب", False, "🇸🇦"), ("al-ettifaq", "الاتفاق", False, "🇸🇦"),
+    ("al-fateh", "الفتح", False, "🇸🇦"), ("al-taawoun", "التعاون", False, "🇸🇦"),
+    # أندية مصرية
+    ("al ahly", "الأهلي المصري", True, "🇪🇬"), ("al-ahly", "الأهلي المصري", True, "🇪🇬"),
+    ("zamalek", "الزمالك", True, "🇪🇬"), ("pyramids", "بيراميدز", True, "🇪🇬"),
+    ("al masry", "المصري البورسعيدي", False, "🇪🇬"), ("ismaily", "الإسماعيلي", False, "🇪🇬"),
+    # أندية مغربية
+    ("wydad", "الوداد", True, "🇲🇦"), ("raja", "الرجاء", True, "🇲🇦"),
+    ("far rabat", "الجيش الملكي", True, "🇲🇦"), ("as far", "الجيش الملكي", True, "🇲🇦"),
+    ("maghreb fassi", "المغرب الفاسي", False, "🇲🇦"), ("rs berkane", "نهضة بركان", True, "🇲🇦"),
+    ("berkane", "نهضة بركان", True, "🇲🇦"), ("hassania", "حسنية أكادير", False, "🇲🇦"),
+    # أندية جزائرية وتونسية
+    ("mc alger", "مولودية الجزائر", True, "🇩🇿"), ("mouloudia", "مولودية الجزائر", True, "🇩🇿"),
+    ("belouizdad", "شباب بلوزداد", True, "🇩🇿"), ("jsk", "شبيبة القبائل", False, "🇩🇿"),
+    ("kabylie", "شبيبة القبائل", False, "🇩🇿"), ("usm alger", "اتحاد العاصمة", True, "🇩🇿"),
+    ("esperance", "الترجي", True, "🇹🇳"), ("espérance", "الترجي", True, "🇹🇳"),
+    ("club africain", "النادي الإفريقي", True, "🇹🇳"), ("etoile du sahel", "النجم الساحلي", True, "🇹🇳"),
+    ("sfaxien", "الصفاقسي", False, "🇹🇳"),
+    # منتخبات عربية
+    ("morocco", "المغرب", True, "🇲🇦"), ("algeria", "الجزائر", True, "🇩🇿"),
+    ("tunisia", "تونس", True, "🇹🇳"), ("egypt", "مصر", True, "🇪🇬"),
+    ("saudi arabia", "السعودية", True, "🇸🇦"), ("saudi", "السعودية", True, "🇸🇦"),
+    ("qatar", "قطر", True, "🇶🇦"), ("united arab emirates", "الإمارات", True, "🇦🇪"),
+    ("uae", "الإمارات", True, "🇦🇪"), ("iraq", "العراق", True, "🇮🇶"),
+    ("jordan", "الأردن", True, "🇯🇴"), ("palestine", "فلسطين", True, "🇵🇸"),
+    ("oman", "عُمان", True, "🇴🇲"), ("kuwait", "الكويت", True, "🇰🇼"),
+    ("bahrain", "البحرين", True, "🇧🇭"), ("lebanon", "لبنان", True, "🇱🇧"),
+    ("syria", "سوريا", True, "🇸🇾"), ("libya", "ليبيا", True, "🇱🇾"),
+    ("sudan", "السودان", True, "🇸🇩"), ("mauritania", "موريتانيا", True, "🇲🇷"),
+    ("yemen", "اليمن", True, "🇾🇪"), ("comoros", "جزر القمر", True, "🇰🇲"),
+    # منتخبات إفريقية
+    ("senegal", "السنغال", True, "🇸🇳"), ("nigeria", "نيجيريا", True, "🇳🇬"),
+    ("ivory coast", "كوت ديفوار", True, "🇨🇮"), ("côte d", "كوت ديفوار", True, "🇨🇮"),
+    ("cameroon", "الكاميرون", True, "🇨🇲"), ("ghana", "غانا", True, "🇬🇭"),
+    ("mali", "مالي", False, "🇲🇱"), ("south africa", "جنوب إفريقيا", False, "🇿🇦"),
+    ("dr congo", "الكونغو الديمقراطية", False, "🇨🇩"),
+    # منتخبات عالمية
+    ("france", "فرنسا", True, "🇫🇷"), ("spain", "إسبانيا", True, "🇪🇸"),
+    ("england", "إنجلترا", True, "🏴"), ("germany", "ألمانيا", True, "🇩🇪"),
+    ("italy", "إيطاليا", True, "🇮🇹"), ("portugal", "البرتغال", True, "🇵🇹"),
+    ("brazil", "البرازيل", True, "🇧🇷"), ("argentina", "الأرجنتين", True, "🇦🇷"),
+    ("netherlands", "هولندا", True, "🇳🇱"), ("belgium", "بلجيكا", True, "🇧🇪"),
+    ("croatia", "كرواتيا", True, "🇭🇷"), ("uruguay", "الأوروغواي", True, "🇺🇾"),
+    ("colombia", "كولومبيا", False, "🇨🇴"), ("mexico", "المكسيك", False, "🇲🇽"),
+    ("united states", "الولايات المتحدة", False, "🇺🇸"), ("japan", "اليابان", False, "🇯🇵"),
+    ("south korea", "كوريا الجنوبية", False, "🇰🇷"), ("turkey", "تركيا", False, "🇹🇷"),
+    ("türkiye", "تركيا", False, "🇹🇷"), ("switzerland", "سويسرا", False, "🇨🇭"),
+    ("denmark", "الدنمارك", False, "🇩🇰"), ("poland", "بولندا", False, "🇵🇱"),
+]
+
+WEEKDAYS = ["الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
+MONTHS = ["يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو",
+          "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر"]
+
+# مطابقة بالكلمة الكاملة حتى لا تطابق roma مع Romania ولا nice مع Venice.
+# المسافة تطابق مسافة أو شرطة (Al Hilal / Al-Hilal).
+_PATTERNS = [
+    (re.compile(r"\b" + re.escape(k).replace(r"\ ", r"[ \-]") + r"\b"), ar, big, flag)
+    for k, ar, big, flag in TEAMS
+]
+_YOUTH = re.compile(r"\bu[ -]?(1[5-9]|2[0-3])\b|\bolympic\b", re.I)
+_WOMEN = re.compile(r"\bwomen|\bfemin|\bladies\b|\bgirls\b|\bw$", re.I)
+RLM = "&#8207;"  # علامة اتجاه من اليمين لليسار (كيان HTML بلا محارف مخفية في الملف)
 
 
-async def arabic_router(update: Update, ctx: Ctx) -> None:
-    if not update.message or not update.message.text:
-        return
-    parts = update.message.text.split()
-    name = parts[0].lstrip("/").split("@")[0]
-    handler = ARABIC_ROUTES.get(name)
-    if handler:
-        ctx.args = parts[1:]
-        await handler(update, ctx)
+def _team(name: str) -> tuple[str, bool, str]:
+    """يعيد (الاسم العربي، مهم؟، علم). الاسم غير المعروف يبقى كما هو."""
+    low = (name or "").lower()
+    for pat, ar, big, flag in _PATTERNS:
+        if pat.search(low):
+            return ar, big, flag
+    clean = (name or "؟").replace(" FC", "").replace("FC ", "").strip()
+    return clean, False, ""
 
 
-async def _post_init(app: Application) -> None:  # type: ignore[type-arg]
-    settings: Settings = app.bot_data["settings"]
-    writer: Writer = app.bot_data["writer"]
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(
-        post_news,
-        "interval",
-        minutes=settings.post_interval_minutes,
-        args=[app.bot, settings, writer],
-        max_instances=1,
-    )
-    args = [app.bot, settings]
+def _day_label(d: datetime) -> str:
+    return f"{WEEKDAYS[d.weekday()]} {d.day} {MONTHS[d.month - 1]} {d.year}"
 
-    def cron(func, env: str, default: str, **extra) -> None:
-        hour, minute = extras.parse_hm(env, default)
-        scheduler.add_job(
-            func, "cron", hour=hour, minute=minute, timezone=fixtures.TZ, args=args,
-            max_instances=1, coalesce=True, misfire_grace_time=3600, **extra,
+
+async def fetch_matches(
+    day: datetime, token: str, client: httpx.AsyncClient | None = None
+) -> list[dict]:
+    """يجلب مباريات اليوم (بتوقيت المغرب). نطلب يوماً قبل وبعد ثم نفلتر محلياً بسبب فرق UTC."""
+    if not token:
+        log.warning("football token is not set; cannot fetch fixtures")
+        return []
+    params = {
+        "competitions": COMPETITIONS,
+        "dateFrom": (day - timedelta(days=1)).strftime("%Y-%m-%d"),
+        "dateTo": (day + timedelta(days=1)).strftime("%Y-%m-%d"),
+    }
+    own = client is None
+    client = client or httpx.AsyncClient(timeout=20)
+    try:
+        r = await client.get(API_URL, params=params, headers={"X-Auth-Token": token})
+        r.raise_for_status()
+        return r.json().get("matches", [])
+    finally:
+        if own:
+            await client.aclose()
+
+
+API_FOOTBALL_URL = "https://v3.football.api-sports.io/fixtures"
+_AF_CACHE: dict = {}
+_AF_TABLE = [
+    ("caf champions league", "caf champions league"),
+    ("caf confederation", "caf confederation cup"),
+    ("africa cup of nations", "africa cup of nations"),
+    ("afc champions league", "afc champions league elite"),
+    ("arab cup", "arab cup"),
+    ("world cup - qualification", "world cup qualifying"),
+    ("uefa nations league", "uefa nations league"),
+    ("euro championship - qualification", "uefa european championship qualifying"),
+]
+_AF_SKIP = {"PST", "CANC", "ABD", "AWD", "WO", "SUSP"}
+
+
+def _af_league_key(league: dict) -> str | None:
+    """يحوّل مسابقة API-Football إلى مفتاح EXTRA_LEAGUES (أو None إن لم تكن مطلوبة)."""
+    name = (league.get("name") or "").lower().strip()
+    country = (league.get("country") or "").lower()
+    if country == "saudi-arabia" and name == "pro league":
+        return "saudi pro league"
+    if country == "egypt" and name == "premier league":
+        return "egyptian premier league"
+    if country == "morocco" and "botola" in name:
+        return "botola pro"
+    if country == "algeria" and name == "ligue 1":
+        return "algerian ligue professionnelle 1"
+    if country == "tunisia" and name == "ligue 1":
+        return "tunisian ligue professionnelle 1"
+    if name == "friendlies":
+        return "international friendlies"
+    return next((v for k, v in _AF_TABLE if k in name), None)
+
+
+def _af_events(payload: dict) -> list[dict]:
+    """يحوّل رد API-Football إلى الشكل الموحد الذي يقرؤه _collect."""
+    out: list[dict] = []
+    for it in payload.get("response") or []:
+        league = it.get("league") or {}
+        key = _af_league_key(league)
+        if not key or re.search(r"women|femin", league.get("name") or "", re.I):
+            continue
+        fx, teams, goals = it.get("fixture") or {}, it.get("teams") or {}, it.get("goals") or {}
+        short = (fx.get("status") or {}).get("short", "")
+        if short in _AF_SKIP:
+            continue
+        try:
+            dt = datetime.fromisoformat(fx["date"]).astimezone(ZoneInfo("UTC"))
+        except (KeyError, ValueError):
+            continue
+        out.append({
+            "strLeague": key,
+            "strHomeTeam": (teams.get("home") or {}).get("name", ""),
+            "strAwayTeam": (teams.get("away") or {}).get("name", ""),
+            "strTimestamp": dt.strftime("%Y-%m-%dT%H:%M:%S"),
+            "intHomeScore": goals.get("home"),
+            "intAwayScore": goals.get("away"),
+            "strStatus": "Match Finished" if short in ("FT", "AET", "PEN") else short,
+        })
+    return out
+
+
+async def _fetch_api_football(day: datetime, key: str, client: httpx.AsyncClient | None = None):
+    """يعيد قائمة الأحداث، أو None إن رفض الحساب الطلب (مثلاً الموسم غير مشمول بالخطة)."""
+    d = day.strftime("%Y-%m-%d")
+    hit = _AF_CACHE.get(d)
+    if hit and time.time() - hit[0] < 600:  # ذاكرة 10 دقائق لتوفير حصة الـ100 طلب
+        return hit[1]
+    own = client is None
+    client = client or httpx.AsyncClient(timeout=20)
+    try:
+        r = await client.get(
+            API_FOOTBALL_URL, params={"date": d, "timezone": TZ.key}, headers={"x-apisports-key": key}
         )
-
-    # كل الأوقات بتوقيت المغرب، ويمكن تغيير كل واحد بمتغير بيئة HH:MM
-    cron(fixtures.post_todays_fixtures, "FIXTURES_TIME", "10:30")   # مباريات اليوم + تثبيت
-    cron(fixtures.post_polls, "POLLS_TIME", "12:30")                # استطلاع «من سيفوز؟»
-    cron(fixtures.post_todays_results, "RESULTS_TIME", "22:00")     # نتائج اليوم
-    cron(summary.post_nightly_summary, "SUMMARY_TIME", "23:00")     # ملخص الليلة
-    cron(fixtures.unpin_fixtures, "UNPIN_TIME", "23:55")            # إلغاء التثبيت
-    cron(summary.post_weekly_scorers, "SCORERS_TIME", "12:00", day_of_week="mon")  # الهدافون
-    scheduler.start()
-    app.bot_data["scheduler"] = scheduler
-
-
-def main() -> None:
-    settings = load_settings()
-    # Create missing tables on startup so deployment doesn't depend on running migrations.
-    Base.metadata.create_all(engine)
-    app = Application.builder().token(settings.telegram_token).post_init(_post_init).build()
-    app.bot_data["settings"] = settings
-    app.bot_data["writer"] = Writer(settings.groq_api_key, settings.groq_model)
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("results", results))
-    app.add_handler(CommandHandler("table", table))
-    app.add_handler(CommandHandler("injuries", injuries))
-    app.add_handler(CommandHandler("transfers", transfers))
-    app.add_handler(CommandHandler("today", today))
-    app.add_handler(CommandHandler("todayresults", today_results))
-    app.add_handler(CommandHandler("test", test_cmd))
-    # تيليغرام يعدّ الشرطة السفلية جزءًا من اسم الأمر، فندعم /test_api وأخواتها أيضًا
-    for name, handler, arg in [
-        ("test_summary", test_cmd, "summary"), ("test_scorers", test_cmd, "scorers"),
-        ("test_poll", test_cmd, "poll"), ("test_news", test_cmd, "news"), ("test_api", test_cmd, "api"),
-        ("todayresults_demo", today_results, "demo"),
-    ]:
-        app.add_handler(CommandHandler(name, _alias(handler, arg)))
-    app.add_handler(MessageHandler(filters.Regex(r"^/[^\sA-Za-z]"), arabic_router))
-    app.run_polling()
+        r.raise_for_status()
+        payload = r.json()
+    finally:
+        if own:
+            await client.aclose()
+    if payload.get("errors"):
+        log.warning("API-Football refused the request: %s", payload["errors"])
+        return None
+    events = _af_events(payload)
+    _AF_CACHE[d] = (time.time(), events)
+    return events
 
 
-if __name__ == "__main__":
-    main()
+async def api_football_check(day: datetime) -> str:
+    """تشخيص للأمر /test api: هل المفتاح يعمل وهل الموسم الحالي مشمول؟"""
+    key = os.getenv("API_FOOTBALL_KEY", "").strip()
+    if not key:
+        return "API_FOOTBALL_KEY غير مضبوط في Railway."
+    d = day.strftime("%Y-%m-%d")
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get(API_FOOTBALL_URL, params={"date": d, "timezone": TZ.key},
+                            headers={"x-apisports-key": key})
+        r.raise_for_status()
+        payload = r.json()
+    except Exception as exc:
+        return f"تعذّر الاتصال بـ API-Football: {exc}"
+    if payload.get("errors"):
+        return f"رفض الحساب الطلب: {payload['errors']}"
+    total = len(payload.get("response") or [])
+    mine = _af_events(payload)
+    names = sorted({e["strLeague"] for e in mine})
+    left = r.headers.get("x-ratelimit-requests-remaining", "؟")
+    return (f"✅ المفتاح يعمل لتاريخ {d}.\nمباريات اليوم عالميًا: {total}\n"
+            f"من المسابقات المطلوبة: {len(mine)} ({', '.join(names) or 'لا شيء'})\nالطلبات المتبقية اليوم: {left}")
+
+
+async def fetch_extra(day: datetime, client: httpx.AsyncClient | None = None) -> list[dict]:
+    """مباريات الدوريات العربية والمنتخبات: API-Football إن وُجد مفتاح، وإلا TheSportsDB.
+    أي فشل يعيد قائمة فارغة بلا ضجيج."""
+    key = os.getenv("API_FOOTBALL_KEY", "").strip()
+    if key:
+        try:
+            events = await _fetch_api_football(day, key)
+            if events is not None:
+                return events
+        except Exception as exc:
+            log.warning("API-Football unavailable (%s); falling back", exc)
+    own = client is None
+    client = client or httpx.AsyncClient(timeout=20, headers=EXTRA_HEADERS, follow_redirects=True)
+    out: list[dict] = []
+    try:
+        for delta in (-1, 0, 1):
+            d = (day + timedelta(days=delta)).strftime("%Y-%m-%d")
+            try:
+                r = await client.get(EXTRA_URL, params={"d": d, "s": "Soccer"})
+                r.raise_for_status()
+                out.extend(r.json().get("events") or [])
+            except Exception as exc:
+                # نكتفي بسطر واحد (بلا Traceback) ونتوقف: المصدر الأول يكفي
+                log.warning("extra fixtures source unavailable (%s); skipping it", exc)
+                break
+    finally:
+        if own:
+            await client.aclose()
+    return out
+
+
+def _collect(
+    matches: list[dict], extra: list[dict], day: datetime, results: bool = False,
+    raw: list | None = None,
+) -> dict[str, dict]:
+    """يوحّد المصدرين: {مفتاح: {"title": عنوان, "rank": ترتيب, "rows": [(وقت، سطر)]}}."""
+    groups: dict[str, dict] = {}
+
+    def add(key, title, rank, kick, home, away, score=None):
+        hn, hbig, hflag = home
+        an, abig, aflag = away
+        star = "🔥 " if hbig and abig else ""
+        h = f"{hflag} {hn}".strip()
+        a = f"{aflag} {an}".strip()
+        if score is not None:
+            line = f"{RLM}{star}{html.escape(h)} <b>({score[0]})</b> ⚔️ <b>({score[1]})</b> {html.escape(a)}{score[2]}"
+        else:
+            line = f"{RLM}🕒 <code>{kick:%H:%M}</code> ┃ {star}{html.escape(h)} ⚔️ {html.escape(a)}"
+        if raw is not None:
+            raw.append({"kick": kick, "home": hn, "away": an, "both_big": bool(hbig and abig),
+                        "code": key, "title": title})
+        g = groups.setdefault(key, {"title": title, "rank": rank, "rows": []})
+        if (kick, line) not in g["rows"]:
+            g["rows"].append((kick, line))
+
+    for m in matches:
+        if results:
+            if m.get("status") != "FINISHED":
+                continue
+        elif m.get("status") in SKIP_STATUS:
+            continue
+        try:
+            kick = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00")).astimezone(TZ)
+        except (KeyError, ValueError):
+            continue
+        if kick.date() != day.date():
+            continue
+        code = (m.get("competition") or {}).get("code", "")
+        if code not in COMP_AR:
+            continue
+        home = _team((m.get("homeTeam") or {}).get("name", ""))
+        away = _team((m.get("awayTeam") or {}).get("name", ""))
+        if code not in ALWAYS and not (home[1] or away[1]):
+            continue
+        score = None
+        if results:
+            sc = m.get("score") or {}
+            ft = sc.get("fullTime") or {}
+            if ft.get("home") is None or ft.get("away") is None:
+                continue
+            pen = sc.get("penalties") or {}
+            note = ""
+            if sc.get("duration") == "PENALTY_SHOOTOUT" and pen.get("home") is not None:
+                note = f" <i>(ركلات الترجيح {pen['home']}-{pen['away']})</i>"
+            score = (ft["home"], ft["away"], note)
+        add(code, COMP_AR[code], COMP_ORDER.index(code), kick, home, away, score)
+
+    for e in extra:
+        league = (e.get("strLeague") or "").strip()
+        title = EXTRA_LEAGUES.get(league.lower())
+        hname, aname = e.get("strHomeTeam") or "", e.get("strAwayTeam") or ""
+        if not title or not hname or not aname:
+            continue
+        if _WOMEN.search(hname + " " + aname + " " + league) or _YOUTH.search(hname + " " + aname):
+            continue
+        ts = e.get("strTimestamp") or ""
+        try:
+            if not ts and e.get("dateEvent") and e.get("strTime"):
+                ts = f"{e['dateEvent']}T{e['strTime']}"
+            kick = datetime.fromisoformat(ts.replace("Z", "")).replace(tzinfo=ZoneInfo("UTC")).astimezone(TZ)
+        except ValueError:
+            continue
+        if kick.date() != day.date():
+            continue
+        home, away = _team(hname), _team(aname)
+        if not (home[1] or away[1]):
+            continue
+        rank = 100 + next((i for i, em in enumerate(EXTRA_ORDER) if title.startswith(em)), 50)
+        score = None
+        if results:
+            hs, as_ = e.get("intHomeScore"), e.get("intAwayScore")
+            done = (e.get("strStatus") or "").lower() in FINISHED_WORDS
+            if hs in (None, "") or as_ in (None, "") or not done:
+                continue
+            score = (hs, as_, "")
+        add("X:" + title, title, rank, kick, home, away, score)
+    return groups
+
+
+def build_messages(matches: list[dict], day: datetime, extra: list[dict] | None = None) -> list[str]:
+    """يبني نص المنشور (قد يكون أكثر من رسالة إن طال). قائمة فارغة إن لم توجد مباريات."""
+    groups = _collect(matches, extra or [], day)
+    if not groups:
+        return []
+
+    total = sum(len(g["rows"]) for g in groups.values())
+    sep = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
+    header = (
+        f"📅 <b>مباريات اليوم</b>\n"
+        f"🗓 {_day_label(day)}\n"
+        f"⚽ {total} مباراة مهمة\n"
+        f"{sep}"
+    )
+    footer = f"{sep}\n⏰ جميع الأوقات بتوقيت المغرب\n🔥 = مواجهة بين طرفين كبيرين\n\n#مباريات_اليوم #كرة_القدم"
+    blocks = []
+    for g in sorted(groups.values(), key=lambda x: x["rank"]):
+        lines = [ln for _, ln in sorted(g["rows"])]
+        blocks.append(f"<b>{g['title']}</b>\n" + "\n".join(lines))
+
+    messages, cur = [], header
+    for b in blocks:
+        if len(cur) + len(b) + len(footer) + 4 > MESSAGE_MAX:
+            messages.append(cur)
+            cur = b
+        else:
+            cur += "\n\n" + b
+    messages.append(cur + "\n\n" + footer)
+    return messages
+
+
+def build_results_messages(
+    matches: list[dict], day: datetime, extra: list[dict] | None = None
+) -> list[str]:
+    """نتائج اليوم للمباريات المنتهية فقط. قائمة فارغة إن لم تنتهِ أي مباراة مهمة."""
+    groups = _collect(matches, extra or [], day, results=True)
+    if not groups:
+        return []
+    total = sum(len(g["rows"]) for g in groups.values())
+    sep = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
+    header = f"📊 <b>نتائج اليوم</b>\n🗓 {_day_label(day)}\n✅ {total} مباراة منتهية\n{sep}"
+    footer = f"{sep}\n🔥 = مواجهة بين طرفين كبيرين\n\n#نتائج #نتائج_المباريات #كرة_القدم"
+    blocks = []
+    for g in sorted(groups.values(), key=lambda x: x["rank"]):
+        lines = [ln for _, ln in sorted(g["rows"])]
+        blocks.append(f"<b>{g['title']}</b>\n" + "\n".join(lines))
+    messages, cur = [], header
+    for b in blocks:
+        if len(cur) + len(b) + len(footer) + 4 > MESSAGE_MAX:
+            messages.append(cur)
+            cur = b
+        else:
+            cur += "\n\n" + b
+    messages.append(cur + "\n\n" + footer)
+    return messages
+
+
+def demo_results(day: datetime) -> list[str]:
+    """منشور نتائج تجريبي (بيانات وهمية) لمعاينة الشكل فقط."""
+    d = day.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%d")
+
+    def fin(code, h, a, hs, as_, t, pen=None):
+        sc = {"fullTime": {"home": hs, "away": as_}}
+        if pen:
+            sc["penalties"] = {"home": pen[0], "away": pen[1]}
+            sc["duration"] = "PENALTY_SHOOTOUT"
+        return {"competition": {"code": code}, "homeTeam": {"name": h}, "awayTeam": {"name": a},
+                "utcDate": f"{d}T{t}:00Z", "status": "FINISHED", "score": sc}
+
+    ms = [
+        fin("CL", "Real Madrid CF", "Paris Saint-Germain FC", 2, 1, "20:00"),
+        fin("CL", "Arsenal FC", "FC Bayern München", 1, 1, "17:45", (4, 3)),
+        fin("PL", "Everton FC", "Liverpool FC", 0, 2, "19:30"),
+    ]
+    ex = [
+        {"strLeague": "Saudi Pro League", "strHomeTeam": "Al-Hilal", "strAwayTeam": "Al-Nassr",
+         "strTimestamp": f"{d}T17:00:00", "intHomeScore": "3", "intAwayScore": "1", "strStatus": "Match Finished"},
+        {"strLeague": "International Friendlies", "strHomeTeam": "Morocco", "strAwayTeam": "Senegal",
+         "strTimestamp": f"{d}T19:00:00", "intHomeScore": "2", "intAwayScore": "0", "strStatus": "Match Finished"},
+    ]
+    return build_results_messages(ms, day, ex)
+
+
+def top_results_lines(
+    matches: list[dict], day: datetime, extra: list[dict] | None = None, n: int = 5
+) -> list[str]:
+    """أبرز نتائج اليوم (الكبار أولاً) كأسطر جاهزة لملخص الليلة."""
+    groups = _collect(matches, extra or [], day, results=True)
+    rows = [(("🔥" not in ln), kick, ln) for g in groups.values() for kick, ln in g["rows"]]
+    rows.sort()
+    return [ln for _, _, ln in rows[:n]]
+
+
+async def _send_all(bot: Bot, settings: Settings, texts: list[str], pin_first: bool = False) -> None:
+    """يرسل الرسائل إلى القناة، والتوقيع في آخر رسالة. يثبّت الأولى عند الطلب."""
+    for i, text in enumerate(texts):
+        if i == len(texts) - 1:
+            text += extras.signature(settings)
+        msg = await bot.send_message(
+            chat_id=settings.channel_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        if pin_first and i == 0:
+            try:
+                await bot.pin_chat_message(
+                    chat_id=settings.channel_id, message_id=msg.message_id, disable_notification=True
+                )
+                PINNED["id"] = msg.message_id
+            except Exception:
+                log.warning("Could not pin fixtures post (is the bot an admin with 'Pin messages'?)",
+                            exc_info=True)
+
+
+PINNED: dict = {}
+
+
+async def unpin_fixtures(bot: Bot, settings: Settings) -> None:
+    """مهمة مسائية: تلغي تثبيت منشور مباريات اليوم."""
+    if not settings.channel_id:
+        return
+    try:
+        if PINNED.get("id"):
+            await bot.unpin_chat_message(chat_id=settings.channel_id, message_id=PINNED["id"])
+        else:  # بعد إعادة تشغيل: يلغي تثبيت آخر منشور مثبّت
+            await bot.unpin_chat_message(chat_id=settings.channel_id)
+        PINNED.clear()
+    except Exception:
+        log.warning("Could not unpin fixtures post", exc_info=True)
+
+
+async def post_todays_results(bot: Bot, settings: Settings) -> None:
+    """مهمة مجدولة: تنشر نتائج مباريات اليوم المنتهية في القناة."""
+    if not settings.channel_id:
+        log.warning("CHANNEL_ID is not set; skipping results post")
+        return
+    today = datetime.now(TZ)
+    try:
+        matches = await fetch_matches(today, settings.football_token)
+    except Exception:
+        log.exception("Failed to fetch today's results")
+        matches = []
+    extra = await fetch_extra(today)
+    texts = build_results_messages(matches, today, extra)
+    if texts:
+        await _send_all(bot, settings, texts)
+
+
+async def post_todays_fixtures(bot: Bot, settings: Settings) -> None:
+    """مهمة مجدولة: تنشر قائمة مباريات اليوم وتثبّتها (لا تنشر شيئاً إن لم توجد مباريات)."""
+    if not settings.channel_id:
+        log.warning("CHANNEL_ID is not set; skipping fixtures post")
+        return
+    today = datetime.now(TZ)
+    try:
+        matches = await fetch_matches(today, settings.football_token)
+    except Exception:
+        log.exception("Failed to fetch today's fixtures")
+        matches = []
+    extra = await fetch_extra(today)
+    texts = build_messages(matches, today, extra)
+    if texts:
+        await _send_all(bot, settings, texts, pin_first=True)
+
+
+def poll_payload(m: dict) -> dict:
+    """وسائط send_poll لمباراة (القناة تتطلب استطلاعاً مجهول الهوية)."""
+    return {
+        "question": f"🔮 من سيفوز؟ {m['home']} ⚔️ {m['away']} ({m['kick']:%H:%M})"[:300],
+        "options": [f"فوز {m['home']}"[:100], "تعادل", f"فوز {m['away']}"[:100]],
+        "is_anonymous": True,
+    }
+
+
+async def post_polls(bot: Bot, settings: Settings) -> None:
+    """استطلاع «من سيفوز؟» للمباريات الكبرى القادمة اليوم (حتى مباراتين)."""
+    if not settings.channel_id:
+        return
+    now = datetime.now(TZ)
+    try:
+        matches = await fetch_matches(now, settings.football_token)
+    except Exception:
+        log.exception("Failed to fetch matches for polls")
+        return
+    raw: list[dict] = []
+    _collect(matches, await fetch_extra(now), now, raw=raw)
+    upcoming = [m for m in raw if m["both_big"] and m["kick"] > now + timedelta(minutes=30)]
+    upcoming.sort(key=lambda m: (m["code"] != "CL", m["kick"]))
+    seen = set()
+    for m in upcoming:
+        key = (m["home"], m["away"])
+        if key in seen:
+            continue
+        seen.add(key)
+        if len(seen) > 2:
+            break
+        try:
+            await bot.send_poll(chat_id=settings.channel_id, **poll_payload(m))
+        except Exception:
+            log.warning("Could not send poll", exc_info=True)
