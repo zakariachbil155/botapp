@@ -19,6 +19,7 @@ import httpx
 from telegram import Bot
 from telegram.constants import ParseMode
 
+from src.bot import extras
 from src.bot.config import Settings
 
 log = logging.getLogger(__name__)
@@ -258,7 +259,8 @@ async def fetch_extra(day: datetime, client: httpx.AsyncClient | None = None) ->
 
 
 def _collect(
-    matches: list[dict], extra: list[dict], day: datetime, results: bool = False
+    matches: list[dict], extra: list[dict], day: datetime, results: bool = False,
+    raw: list | None = None,
 ) -> dict[str, dict]:
     """يوحّد المصدرين: {مفتاح: {"title": عنوان, "rank": ترتيب, "rows": [(وقت، سطر)]}}."""
     groups: dict[str, dict] = {}
@@ -273,6 +275,9 @@ def _collect(
             line = f"{RLM}{star}{html.escape(h)} <b>({score[0]})</b> ⚔️ <b>({score[1]})</b> {html.escape(a)}{score[2]}"
         else:
             line = f"{RLM}🕒 <code>{kick:%H:%M}</code> ┃ {star}{html.escape(h)} ⚔️ {html.escape(a)}"
+        if raw is not None:
+            raw.append({"kick": kick, "home": hn, "away": an, "both_big": bool(hbig and abig),
+                        "code": key, "title": title})
         g = groups.setdefault(key, {"title": title, "rank": rank, "rows": []})
         if (kick, line) not in g["rows"]:
             g["rows"].append((kick, line))
@@ -382,7 +387,7 @@ def build_results_messages(
     total = sum(len(g["rows"]) for g in groups.values())
     sep = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
     header = f"📊 <b>نتائج اليوم</b>\n🗓 {_day_label(day)}\n✅ {total} مباراة منتهية\n{sep}"
-    footer = f"{sep}\n🔥 = مواجهة بين طرفين كبيرين\n\n#نتائج_المباريات #كرة_القدم"
+    footer = f"{sep}\n🔥 = مواجهة بين طرفين كبيرين\n\n#نتائج #نتائج_المباريات #كرة_القدم"
     blocks = []
     for g in sorted(groups.values(), key=lambda x: x["rank"]):
         lines = [ln for _, ln in sorted(g["rows"])]
@@ -424,6 +429,55 @@ def demo_results(day: datetime) -> list[str]:
     return build_results_messages(ms, day, ex)
 
 
+def top_results_lines(
+    matches: list[dict], day: datetime, extra: list[dict] | None = None, n: int = 5
+) -> list[str]:
+    """أبرز نتائج اليوم (الكبار أولاً) كأسطر جاهزة لملخص الليلة."""
+    groups = _collect(matches, extra or [], day, results=True)
+    rows = [(("🔥" not in ln), kick, ln) for g in groups.values() for kick, ln in g["rows"]]
+    rows.sort()
+    return [ln for _, _, ln in rows[:n]]
+
+
+async def _send_all(bot: Bot, settings: Settings, texts: list[str], pin_first: bool = False) -> None:
+    """يرسل الرسائل إلى القناة، والتوقيع في آخر رسالة. يثبّت الأولى عند الطلب."""
+    for i, text in enumerate(texts):
+        if i == len(texts) - 1:
+            text += extras.signature(settings)
+        msg = await bot.send_message(
+            chat_id=settings.channel_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        if pin_first and i == 0:
+            try:
+                await bot.pin_chat_message(
+                    chat_id=settings.channel_id, message_id=msg.message_id, disable_notification=True
+                )
+                PINNED["id"] = msg.message_id
+            except Exception:
+                log.warning("Could not pin fixtures post (is the bot an admin with 'Pin messages'?)",
+                            exc_info=True)
+
+
+PINNED: dict = {}
+
+
+async def unpin_fixtures(bot: Bot, settings: Settings) -> None:
+    """مهمة مسائية: تلغي تثبيت منشور مباريات اليوم."""
+    if not settings.channel_id:
+        return
+    try:
+        if PINNED.get("id"):
+            await bot.unpin_chat_message(chat_id=settings.channel_id, message_id=PINNED["id"])
+        else:  # بعد إعادة تشغيل: يلغي تثبيت آخر منشور مثبّت
+            await bot.unpin_chat_message(chat_id=settings.channel_id)
+        PINNED.clear()
+    except Exception:
+        log.warning("Could not unpin fixtures post", exc_info=True)
+
+
 async def post_todays_results(bot: Bot, settings: Settings) -> None:
     """مهمة مجدولة: تنشر نتائج مباريات اليوم المنتهية في القناة."""
     if not settings.channel_id:
@@ -436,17 +490,13 @@ async def post_todays_results(bot: Bot, settings: Settings) -> None:
         log.exception("Failed to fetch today's results")
         matches = []
     extra = await fetch_extra(today)
-    for text in build_results_messages(matches, today, extra):
-        await bot.send_message(
-            chat_id=settings.channel_id,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+    texts = build_results_messages(matches, today, extra)
+    if texts:
+        await _send_all(bot, settings, texts)
 
 
 async def post_todays_fixtures(bot: Bot, settings: Settings) -> None:
-    """مهمة مجدولة: تنشر قائمة مباريات اليوم في القناة (لا تنشر شيئاً إن لم توجد مباريات)."""
+    """مهمة مجدولة: تنشر قائمة مباريات اليوم وتثبّتها (لا تنشر شيئاً إن لم توجد مباريات)."""
     if not settings.channel_id:
         log.warning("CHANNEL_ID is not set; skipping fixtures post")
         return
@@ -457,10 +507,39 @@ async def post_todays_fixtures(bot: Bot, settings: Settings) -> None:
         log.exception("Failed to fetch today's fixtures")
         matches = []
     extra = await fetch_extra(today)
-    for text in build_messages(matches, today, extra):
-        await bot.send_message(
-            chat_id=settings.channel_id,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+    texts = build_messages(matches, today, extra)
+    if texts:
+        await _send_all(bot, settings, texts, pin_first=True)
+
+
+async def post_polls(bot: Bot, settings: Settings) -> None:
+    """استطلاع «من سيفوز؟» للمباريات الكبرى القادمة اليوم (حتى مباراتين)."""
+    if not settings.channel_id:
+        return
+    now = datetime.now(TZ)
+    try:
+        matches = await fetch_matches(now, settings.football_token)
+    except Exception:
+        log.exception("Failed to fetch matches for polls")
+        return
+    raw: list[dict] = []
+    _collect(matches, await fetch_extra(now), now, raw=raw)
+    upcoming = [m for m in raw if m["both_big"] and m["kick"] > now + timedelta(minutes=30)]
+    upcoming.sort(key=lambda m: (m["code"] != "CL", m["kick"]))
+    seen = set()
+    for m in upcoming:
+        key = (m["home"], m["away"])
+        if key in seen:
+            continue
+        seen.add(key)
+        if len(seen) > 2:
+            break
+        try:
+            await bot.send_poll(
+                chat_id=settings.channel_id,
+                question=f"🔮 من سيفوز؟ {m['home']} ⚔️ {m['away']} ({m['kick']:%H:%M})"[:300],
+                options=[f"فوز {m['home']}"[:100], "تعادل", f"فوز {m['away']}"[:100]],
+                is_anonymous=True,
+            )
+        except Exception:
+            log.warning("Could not send poll", exc_info=True)
