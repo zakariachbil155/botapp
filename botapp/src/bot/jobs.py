@@ -6,6 +6,7 @@ from sqlalchemy import select
 from telegram import Bot
 from telegram.constants import ParseMode
 
+from src.bot import extras
 from src.bot.config import Settings
 from src.bot.feeds import Entry, fetch_entries
 from src.bot.filters import is_womens
@@ -39,8 +40,9 @@ def _clean(text: str, limit: int) -> str:
     return text
 
 
-def _compose(text: str, link: str) -> str:
-    return f'{html.escape(text)}\n\n<a href="{html.escape(link)}">المصدر</a>'
+def _compose(text: str, settings: Settings) -> str:
+    # رابط المصدر صار زراً تحت المنشور، والتوقيع (إن وُجد رابط القناة) في آخره.
+    return f"{html.escape(text)}{extras.signature(settings)}"
 
 
 async def _publish(bot: Bot, settings: Settings, entry: Entry, text: str) -> None:
@@ -50,16 +52,18 @@ async def _publish(bot: Bot, settings: Settings, entry: Entry, text: str) -> Non
             await bot.send_photo(
                 chat_id=settings.channel_id,
                 photo=entry.image,
-                caption=_compose(_clean(text, CAPTION_TEXT_MAX), entry.link),
+                caption=_compose(_clean(text, CAPTION_TEXT_MAX), settings),
                 parse_mode=ParseMode.HTML,
+                reply_markup=extras.buttons(entry.link, settings),
             )
             return
         except Exception:
             log.warning("Photo post failed for %s; falling back to text", entry.link)
     await bot.send_message(
         chat_id=settings.channel_id,
-        text=_compose(_clean(text, MESSAGE_TEXT_MAX), entry.link),
+        text=_compose(_clean(text, MESSAGE_TEXT_MAX), settings),
         parse_mode=ParseMode.HTML,
+        reply_markup=extras.buttons(entry.link, settings),
     )
 
 
@@ -69,10 +73,17 @@ async def post_news(bot: Bot, settings: Settings, writer: Writer) -> None:
         log.warning("CHANNEL_ID is not set; skipping scheduled posting")
         return
     entries = await fetch_entries(settings.news_feeds)
+    quiet = extras.is_quiet_now()
+    # العاجل أولاً ثم المغرب والعرب، ثم الباقي بترتيبه الأصلي (الفرز مستقر).
+    scored = {id(e): (extras.is_breaking(e), extras.priority(e)) for e in entries}
+    entries = sorted(entries, key=lambda e: -scored[id(e)][1])
     posted = 0
     for entry in entries:
         if posted >= settings.max_posts_per_run:
             break
+        brk = scored[id(entry)][0]
+        if quiet and not brk:
+            continue  # ساعات الهدوء: العاجل فقط، والباقي ينتظر الصباح
         if _already_posted(entry.link):
             continue
         # Skip women's football before spending an AI call on it.
@@ -86,8 +97,10 @@ async def post_news(bot: Bot, settings: Settings, writer: Writer) -> None:
                 log.info("Skipping non-football/women's item: %s", entry.title)
                 _mark_posted(entry.link)
                 continue
+            text = extras.decorate(text, entry, brk)
             await _publish(bot, settings, entry, text)
             _mark_posted(entry.link)
+            extras.remember(entry, text, brk)
             posted += 1
         except Exception:
             log.exception("Failed to post %s", entry.link)
