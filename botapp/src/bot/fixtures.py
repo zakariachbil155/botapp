@@ -512,6 +512,15 @@ async def post_todays_fixtures(bot: Bot, settings: Settings) -> None:
         await _send_all(bot, settings, texts, pin_first=True)
 
 
+def poll_payload(m: dict) -> dict:
+    """وسائط send_poll لمباراة (القناة تتطلب استطلاعاً مجهول الهوية)."""
+    return {
+        "question": f"🔮 من سيفوز؟ {m['home']} ⚔️ {m['away']} ({m['kick']:%H:%M})"[:300],
+        "options": [f"فوز {m['home']}"[:100], "تعادل", f"فوز {m['away']}"[:100]],
+        "is_anonymous": True,
+    }
+
+
 async def post_polls(bot: Bot, settings: Settings) -> None:
     """استطلاع «من سيفوز؟» للمباريات الكبرى القادمة اليوم (حتى مباراتين)."""
     if not settings.channel_id:
@@ -535,11 +544,6 @@ async def post_polls(bot: Bot, settings: Settings) -> None:
         if len(seen) > 2:
             break
         try:
-            await bot.send_poll(
-                chat_id=settings.channel_id,
-                question=f"🔮 من سيفوز؟ {m['home']} ⚔️ {m['away']} ({m['kick']:%H:%M})"[:300],
-                options=[f"فوز {m['home']}"[:100], "تعادل", f"فوز {m['away']}"[:100]],
-                is_anonymous=True,
-            )
+            await bot.send_poll(chat_id=settings.channel_id, **poll_payload(m))
         except Exception:
             log.warning("Could not send poll", exc_info=True)
