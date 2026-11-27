@@ -139,3 +139,29 @@ async def post_weekly_scorers(bot: Bot, settings: Settings) -> None:
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
+
+
+def build_weekly(news: list[dict], day: datetime) -> str:
+    if not news:
+        return ""
+    parts = ["🗓 <b>ملخص الأسبوع</b>", f"📅 حتى {fixtures._day_label(day)}", SEP,
+             "📰 <b>أهم 5 أخبار هذا الأسبوع</b>"]
+    for i, n in enumerate(news, 1):
+        title = html.escape(n["title"])
+        link = html.escape(n["link"], quote=True)
+        parts.append(f'<b>{i}.</b> <a href="{link}">{title}</a>' if link else f"<b>{i}.</b> {title}")
+    parts += ["", SEP, "🔔 أسبوع سعيد ونراكم على خير", "", "#ملخص_الأسبوع #كرة_القدم"]
+    return "\n".join(parts)
+
+
+async def post_weekly_summary(bot: Bot, settings: Settings) -> None:
+    if not settings.channel_id:
+        return
+    text = build_weekly(extras.top_week(5), datetime.now(fixtures.TZ))
+    if text:
+        await bot.send_message(
+            chat_id=settings.channel_id,
+            text=text + extras.signature(settings),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
