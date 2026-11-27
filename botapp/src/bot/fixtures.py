@@ -11,6 +11,7 @@
 import html
 import logging
 import os
+import asyncio
 import re
 import time
 from datetime import datetime, timedelta
@@ -200,8 +201,13 @@ _WOMEN = re.compile(r"\bwomen|\bfemin|\bladies\b|\bgirls\b|\bw$", re.I)
 RLM = "&#8207;"  # علامة اتجاه من اليمين لليسار (كيان HTML بلا محارف مخفية في الملف)
 
 
+_AR_LOOKUP = {ar: (ar, big, flag) for _k, ar, big, flag in TEAMS}
+
+
 def _team(name: str) -> tuple[str, bool, str]:
     """يعيد (الاسم العربي، مهم؟، علم). الاسم غير المعروف يبقى كما هو."""
+    if (name or "").strip() in _AR_LOOKUP:  # اسم عربي مكتوب يدوياً
+        return _AR_LOOKUP[name.strip()]
     low = (name or "").lower()
     for pat, ar, big, flag in _PATTERNS:
         if pat.search(low):
@@ -324,41 +330,133 @@ async def _fetch_api_football(day: datetime, key: str, client: httpx.AsyncClient
     return events
 
 
-async def api_football_check(day: datetime) -> str:
-    """تشخيص للأمر /test api: هل المفتاح يعمل وهل الموسم الحالي مشمول؟"""
-    key = os.getenv("API_FOOTBALL_KEY", "").strip()
-    if not key:
-        return "API_FOOTBALL_KEY غير مضبوط في Railway."
-    d = day.strftime("%Y-%m-%d")
+ESPN_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard"
+# رموز مسابقات ESPN -> مفتاح EXTRA_LEAGUES. الرمز غير الموجود عندهم يفشل بصمت ويُتجاوز.
+ESPN_LEAGUES = {
+    "ksa.1": "saudi pro league", "egy.1": "egyptian premier league", "mar.1": "botola pro",
+    "alg.1": "algerian ligue professionnelle 1", "tun.1": "tunisian ligue professionnelle 1",
+    "caf.champions": "caf champions league", "caf.confed": "caf confederation cup",
+    "caf.nations": "africa cup of nations", "afc.champions": "afc champions league elite",
+    "fifa.friendly": "international friendlies",
+    "fifa.worldq.caf": "world cup qualifying", "fifa.worldq.afc": "world cup qualifying",
+    "fifa.worldq.uefa": "world cup qualifying", "fifa.worldq.conmebol": "world cup qualifying",
+    "fifa.worldq.concacaf": "world cup qualifying",
+    "uefa.nations": "uefa nations league", "uefa.euroq": "uefa european championship qualifying",
+}
+_ESPN_BAD = ("POSTPONED", "CANCEL", "SUSPENDED", "ABANDONED")
+_ESPN_CACHE: dict = {}
+
+
+def _espn_events(slug: str, payload: dict) -> list[dict]:
+    """يحوّل رد ESPN إلى الشكل الموحد الذي يقرؤه _collect."""
+    out: list[dict] = []
+    for ev in payload.get("events") or []:
+        comp = (ev.get("competitions") or [{}])[0]
+        sides = comp.get("competitors") or []
+        home = next((c for c in sides if c.get("homeAway") == "home"), None)
+        away = next((c for c in sides if c.get("homeAway") == "away"), None)
+        st = (ev.get("status") or {}).get("type") or {}
+        if not home or not away or any(w in (st.get("name") or "").upper() for w in _ESPN_BAD):
+            continue
+        try:
+            dt = datetime.fromisoformat(ev["date"].replace("Z", "+00:00")).astimezone(ZoneInfo("UTC"))
+        except (KeyError, ValueError):
+            continue
+        done = st.get("state") == "post"
+        out.append({
+            "strLeague": ESPN_LEAGUES[slug],
+            "strHomeTeam": (home.get("team") or {}).get("displayName", ""),
+            "strAwayTeam": (away.get("team") or {}).get("displayName", ""),
+            "strTimestamp": dt.strftime("%Y-%m-%dT%H:%M:%S"),
+            "intHomeScore": home.get("score") if done else None,
+            "intAwayScore": away.get("score") if done else None,
+            "strStatus": "Match Finished" if done else (st.get("state") or ""),
+        })
+    return out
+
+
+async def _espn_one(client: httpx.AsyncClient, slug: str, rng: str):
     try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.get(API_FOOTBALL_URL, params={"date": d, "timezone": TZ.key},
-                            headers={"x-apisports-key": key})
+        r = await client.get(ESPN_URL.format(slug=slug), params={"dates": rng})
         r.raise_for_status()
-        payload = r.json()
+        return slug, _espn_events(slug, r.json()), None
     except Exception as exc:
-        return f"تعذّر الاتصال بـ API-Football: {exc}"
-    if payload.get("errors"):
-        return f"رفض الحساب الطلب: {payload['errors']}"
-    total = len(payload.get("response") or [])
-    mine = _af_events(payload)
-    names = sorted({e["strLeague"] for e in mine})
-    left = r.headers.get("x-ratelimit-requests-remaining", "؟")
-    return (f"✅ المفتاح يعمل لتاريخ {d}.\nمباريات اليوم عالميًا: {total}\n"
-            f"من المسابقات المطلوبة: {len(mine)} ({', '.join(names) or 'لا شيء'})\nالطلبات المتبقية اليوم: {left}")
+        return slug, [], str(exc)[:80]
 
 
-async def fetch_extra(day: datetime, client: httpx.AsyncClient | None = None) -> list[dict]:
-    """مباريات الدوريات العربية والمنتخبات: API-Football إن وُجد مفتاح، وإلا TheSportsDB.
-    أي فشل يعيد قائمة فارغة بلا ضجيج."""
+async def fetch_espn(day: datetime, client: httpx.AsyncClient | None = None):
+    """يعيد (الأحداث، {الرمز: سبب الفشل}). ذاكرة 10 دقائق."""
+    rng = f"{(day - timedelta(days=1)):%Y%m%d}-{(day + timedelta(days=1)):%Y%m%d}"
+    hit = _ESPN_CACHE.get(rng)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1], hit[2]
+    own = client is None
+    client = client or httpx.AsyncClient(
+        timeout=15, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0 (compatible; FootballNewsBot/1.0)"}
+    )
+    try:
+        results = await asyncio.gather(*[_espn_one(client, s, rng) for s in ESPN_LEAGUES])
+    finally:
+        if own:
+            await client.aclose()
+    events = [e for _s, evs, _err in results for e in evs]
+    errors = {s: err for s, _evs, err in results if err}
+    if len(errors) < len(ESPN_LEAGUES):  # لا نخزّن فشلاً كاملاً
+        _ESPN_CACHE[rng] = (time.time(), events, errors)
+    return events, errors
+
+
+async def api_football_check(day: datetime) -> str:
+    """تشخيص للأمر /test api: حالة كل مصدر للمباريات العربية."""
+    lines = []
     key = os.getenv("API_FOOTBALL_KEY", "").strip()
     if key:
         try:
-            events = await _fetch_api_football(day, key)
-            if events is not None:
-                return events
+            ev = await _fetch_api_football(day, key)
+            lines.append("API-Football: " + (f"يعمل ({len(ev)} مباراة)" if ev is not None else "رفض الحساب الطلب"))
+        except Exception as exc:
+            lines.append(f"API-Football: فشل ({str(exc)[:60]})")
+    else:
+        lines.append("API-Football: غير مضبوط (لا بأس)")
+    try:
+        events, errors = await fetch_espn(day)
+        ok = [s for s in ESPN_LEAGUES if s not in errors]
+        lines.append(f"ESPN: {len(events)} مباراة من {len(ok)}/{len(ESPN_LEAGUES)} مسابقة")
+        if errors:
+            lines.append("  لم تعمل: " + ", ".join(sorted(errors)[:8]) + (" ..." if len(errors) > 8 else ""))
+            lines.append("  أول سبب: " + next(iter(errors.values())))
+        names = sorted({_af_key for _af_key in (e["strLeague"] for e in events)})
+        if names:
+            lines.append("  المسابقات: " + ", ".join(names))
+    except Exception as exc:
+        lines.append(f"ESPN: فشل ({str(exc)[:60]})")
+    return "\n".join(lines)
+
+
+async def fetch_extra(day: datetime, client: httpx.AsyncClient | None = None) -> list[dict]:
+    """مباريات الدوريات العربية والمنتخبات. الأولوية: API-Football (إن وُجد مفتاح)، ثم ESPN،
+    ثم TheSportsDB. أي فشل يعيد قائمة فارغة ولا يوقف البوت."""
+    events: list[dict] = []
+    key = os.getenv("API_FOOTBALL_KEY", "").strip()
+    if key:
+        try:
+            events = await _fetch_api_football(day, key) or []
         except Exception as exc:
             log.warning("API-Football unavailable (%s); falling back", exc)
+    if not events:
+        try:
+            events, errors = await fetch_espn(day)
+            if errors and not events:
+                log.warning("ESPN unavailable for all leagues (e.g. %s)", next(iter(errors.values())))
+        except Exception as exc:
+            log.warning("ESPN failed (%s)", exc)
+            events = []
+    if not events:
+        events = await _fetch_thesportsdb(day, client)
+    return events
+
+
+async def _fetch_thesportsdb(day: datetime, client: httpx.AsyncClient | None = None) -> list[dict]:
     own = client is None
     client = client or httpx.AsyncClient(timeout=20, headers=EXTRA_HEADERS, follow_redirects=True)
     out: list[dict] = []
@@ -398,7 +496,8 @@ def _collect(
             line = f"{RLM}🕒 <code>{kick:%H:%M}</code> ┃ {star}{html.escape(h)} ⚔️ {html.escape(a)}"
         if raw is not None:
             raw.append({"kick": kick, "home": hn, "away": an, "both_big": bool(hbig and abig),
-                        "code": key, "title": title})
+                        "code": key, "title": title,
+                        "hflag": hflag, "aflag": aflag, "morocco": "🇲🇦" in (hflag, aflag)})
         g = groups.setdefault(key, {"title": title, "rank": rank, "rows": []})
         if (kick, line) not in g["rows"]:
             g["rows"].append((kick, line))
@@ -668,3 +767,93 @@ async def post_polls(bot: Bot, settings: Settings) -> None:
             await bot.send_poll(chat_id=settings.channel_id, **poll_payload(m))
         except Exception:
             log.warning("Could not send poll", exc_info=True)
+
+
+REMINDED: set = set()
+
+
+async def post_match_reminders(bot: Bot, settings: Settings) -> None:
+    """تذكير قبل نحو ساعة من المباريات الكبرى ومباريات المغرب (يعمل كل 15 دقيقة)."""
+    if not settings.channel_id or extras.is_quiet_now():
+        return
+    now = datetime.now(TZ)
+    try:
+        matches = await fetch_matches(now, settings.football_token)
+    except Exception:
+        log.exception("Failed to fetch matches for reminders")
+        matches = []
+    raw: list[dict] = []
+    _collect(matches, await fetch_extra(now), now, raw=raw)
+    for m in raw:
+        if not (m["both_big"] or m["morocco"]):
+            continue
+        mins = (m["kick"] - now).total_seconds() / 60
+        key = (m["kick"].date(), m["home"], m["away"])
+        if not (35 <= mins <= 80) or key in REMINDED:
+            continue
+        REMINDED.add(key)
+        if len(REMINDED) > 200:
+            REMINDED.clear()
+            REMINDED.add(key)
+        h = f"{m['hflag']} {m['home']}".strip()
+        a = f"{m['aflag']} {m['away']}".strip()
+        text = (
+            f"⏰ <b>بعد نحو ساعة</b>\n\n{RLM}🔥 {html.escape(h)} ⚔️ {html.escape(a)}\n"
+            f"🕒 <code>{m['kick']:%H:%M}</code> ┃ {html.escape(m['title'])}\n\n#مباراة_اليوم"
+        )
+        try:
+            await bot.send_message(
+                chat_id=settings.channel_id, text=text + extras.signature(settings),
+                parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            )
+        except Exception:
+            log.warning("Could not send match reminder", exc_info=True)
+
+
+_MANUAL_TIME = re.compile(r"(?<!\d)(\d{1,2})[:.](\d{2})(?!\d)")
+_MANUAL_SPLIT = re.compile(r"\s*[-–—]\s*|\s+(?:ضد|vs\.?)\s+", re.I)
+
+
+def build_manual(text: str, day: datetime) -> str:
+    """يحوّل نصاً تكتبه أنت إلى منشور جميل. كل سطر: «الوداد - الرجاء 20:00».
+    سطر بلا وقت = عنوان بطولة لما بعده (مثل «🇲🇦 الدوري المغربي»). السطر الأول «غداً» يغيّر التاريخ."""
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if lines and lines[0].replace("ً", "") in ("غدا", "غدًا", "غد"):
+        day = day + timedelta(days=1)
+        lines = lines[1:]
+    groups: dict[str, list] = {}
+    title = "🌍 مباريات عربية"
+    for ln in lines:
+        mt = _MANUAL_TIME.search(ln)
+        if not mt:
+            title = ln.lstrip("#").strip() or title
+            continue
+        teams = _MANUAL_SPLIT.split((ln[: mt.start()] + " " + ln[mt.end():]).strip(), maxsplit=1)
+        if len(teams) != 2:
+            continue
+        hname, aname = teams[0].strip(), teams[1].strip()
+        rest = ""
+        # ما بعد الوقت في السطر نفسه قد يكون اسم البطولة
+        tail = ln[mt.end():].strip()
+        if tail and tail in aname:
+            aname = aname.replace(tail, "").strip()
+            rest = tail
+        if not hname or not aname:
+            continue
+        h, a = _team(hname), _team(aname)
+        hh, mm = int(mt.group(1)), int(mt.group(2))
+        if hh > 23 or mm > 59:
+            continue
+        star = "🔥 " if h[1] and a[1] else ""
+        row = (f"{RLM}🕒 <code>{hh:02d}:{mm:02d}</code> ┃ {star}"
+               f"{html.escape((h[2] + ' ' + h[0]).strip())} ⚔️ {html.escape((a[2] + ' ' + a[0]).strip())}")
+        groups.setdefault(rest or title, []).append(((hh, mm), row))
+    if not groups:
+        return ""
+    total = sum(len(v) for v in groups.values())
+    sep = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
+    parts = [f"📅 <b>مباريات عربية</b>", f"🗓 {_day_label(day)}", f"⚽ {total} مباراة", sep]
+    for ttl, rows in groups.items():
+        parts += ["", f"<b>{html.escape(ttl)}</b>"] + [r for _, r in sorted(rows)]
+    parts += ["", sep, "⏰ جميع الأوقات بتوقيت المغرب", "", "#مباريات_اليوم #كرة_القدم"]
+    return "\n".join(parts)
