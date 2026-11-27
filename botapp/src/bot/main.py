@@ -107,45 +107,6 @@ async def transfers(update: Update, ctx: Ctx) -> None:
     await _rss_command(update, ctx, "transfers")
 
 
-async def _arab_news(update: Update, ctx: Ctx, only_morocco: bool) -> None:
-    """أحدث أخبار المغرب/الدوريات العربية من كل المصادر، تصلك أنت فقط."""
-    s = _settings(ctx)
-    writer: Writer = ctx.bot_data["writer"]
-    try:
-        entries = [e for e in await fetch_entries(s.news_feeds) if not is_womens(e)]
-        pick = extras.is_morocco if only_morocco else (lambda e: extras.is_morocco(e) or extras.is_arab(e))
-        entries = [e for e in entries if pick(e)][:8]
-        sent = 0
-        for entry in entries:
-            if sent >= 3:
-                break
-            text = await writer.rewrite(entry)
-            if not text:
-                continue
-            text = extras.decorate(text, entry, extras.is_breaking(entry))
-            if update.message:
-                await update.message.reply_text(
-                    html.escape(text) + extras.signature(s),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=extras.buttons(entry.link, s),
-                    disable_web_page_preview=True,
-                )
-            sent += 1
-        if not sent:
-            await _reply(update, "لا توجد أخبار مطابقة الآن.")
-    except Exception:
-        log.exception("Arab news command failed")
-        await _reply(update, "تعذّر جلب الأخبار الآن، حاول بعد قليل.")
-
-
-async def morocco(update: Update, ctx: Ctx) -> None:
-    await _arab_news(update, ctx, True)
-
-
-async def arab(update: Update, ctx: Ctx) -> None:
-    await _arab_news(update, ctx, False)
-
-
 async def today(update: Update, ctx: Ctx) -> None:
     """مباريات اليوم عند الطلب (نفس قائمة منشور 10:30)."""
     now = datetime.now(fixtures.TZ)
@@ -247,7 +208,6 @@ async def start(update: Update, _ctx: Ctx) -> None:
         "/إصابات — أخبار الإصابات\n"
         "/انتقالات — أخبار الانتقالات\n"
         "/مباريات — مباريات اليوم\n"
-        "/morocco — أخبار المغرب\n/arab — أخبار الدوريات العربية\n"
         "/todayresults — نتائج اليوم\n/todayresults_demo — معاينة شكل النتائج\n\n"
         "الدوريات: PL, PD, SA, BL1, FL1",
     )
@@ -261,8 +221,6 @@ ARABIC_ROUTES = {
     "إصابات": injuries,
     "اصابات": injuries,
     "انتقالات": transfers,
-    "مغرب": morocco,
-    "عربي": arab,
     "مباريات": today,
     "اليوم": today,
     "نتائج_اليوم": today_results,
@@ -326,8 +284,6 @@ def main() -> None:
     app.add_handler(CommandHandler("injuries", injuries))
     app.add_handler(CommandHandler("transfers", transfers))
     app.add_handler(CommandHandler("today", today))
-    app.add_handler(CommandHandler("morocco", morocco))
-    app.add_handler(CommandHandler("arab", arab))
     app.add_handler(CommandHandler("todayresults", today_results))
     app.add_handler(CommandHandler("test", test_cmd))
     # تيليغرام يعدّ الشرطة السفلية جزءًا من اسم الأمر، فندعم /test_api وأخواتها أيضًا
