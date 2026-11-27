@@ -10,7 +10,7 @@ import html
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
@@ -218,16 +218,29 @@ def decorate(text: str, entry, brk: bool) -> str:
 
 # ---------------------------------------------------------------- ذاكرة الملخص
 DIGEST: list[dict] = []
+WEEK: list[dict] = []
 
 
 def remember(entry, text: str, brk: bool) -> None:
     """يحفظ الخبر المنشور لملخص الليلة (في الذاكرة فقط، ويُفرَّغ عند إعادة التشغيل)."""
     today = datetime.now(TZ).date()
     DIGEST[:] = [d for d in DIGEST if d["day"] == today]
-    DIGEST.append({
+    item = {
         "day": today, "title": text.split("\n")[0], "link": getattr(entry, "link", ""),
         "prio": priority(entry), "n": len(DIGEST),
-    })
+    }
+    DIGEST.append(item)
+    cutoff = today - timedelta(days=7)
+    WEEK[:] = [w for w in WEEK if w["day"] > cutoff]
+    WEEK.append(dict(item))
+
+
+def top_week(n: int = 5) -> list[dict]:
+    """أهم أخبار آخر 7 أيام (الأعلى أولوية ثم الأحدث)."""
+    cutoff = datetime.now(TZ).date() - timedelta(days=7)
+    items = [w for w in WEEK if w["day"] > cutoff]
+    items.sort(key=lambda w: (-w["prio"], -w["day"].toordinal(), -w["n"]))
+    return items[:n]
 
 
 def top_news(n: int = 5) -> list[dict]:
