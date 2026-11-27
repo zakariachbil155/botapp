@@ -1,13 +1,15 @@
 import html
+import uuid
 import logging
 from types import SimpleNamespace
 from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -18,6 +20,7 @@ from src.bot import extras, fixtures, football, summary
 from src.bot.config import Settings, load_settings
 from src.bot.feeds import INJURY_WORDS, TRANSFER_WORDS, fetch_entries
 from src.bot.filters import is_womens
+from src.bot import jobs
 from src.bot.jobs import post_news
 from src.bot.models import PostedItem  # noqa: F401  (registers the table)
 from src.bot.writer import Writer
@@ -105,6 +108,161 @@ async def injuries(update: Update, ctx: Ctx) -> None:
 
 async def transfers(update: Update, ctx: Ctx) -> None:
     await _rss_command(update, ctx, "transfers")
+
+
+async def _is_admin(ctx: Ctx, user_id: int) -> bool:
+    """مشرف القناة فقط (أو من وضعت رقمه في ADMIN_IDS)."""
+    import os
+    ids = {x.strip() for x in (os.getenv("ADMIN_IDS") or "").split(",") if x.strip()}
+    if str(user_id) in ids:
+        return True
+    try:
+        m = await ctx.bot.get_chat_member(_settings(ctx).channel_id, user_id)
+        return m.status in ("administrator", "creator")
+    except Exception:
+        log.warning("Admin check failed", exc_info=True)
+        return False
+
+
+def _preview_markup(ctx: Ctx, entry, text: str, with_publish: bool = True):
+    s = _settings(ctx)
+    base = extras.buttons(entry.link, s)
+    rows = [list(r) for r in base.inline_keyboard] if base else []
+    if with_publish:
+        pend = ctx.bot_data.setdefault("pending", {})
+        if len(pend) > 100:
+            pend.clear()
+        key = uuid.uuid4().hex[:8]
+        pend[key] = (entry, text)
+        rows.append([InlineKeyboardButton("📣 انشر في القناة", callback_data=f"pub:{key}")])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def publish_cb(update: Update, ctx: Ctx) -> None:
+    q = update.callback_query
+    if not q or not q.data or not q.data.startswith("pub:"):
+        return
+    if not await _is_admin(ctx, q.from_user.id):
+        await q.answer("هذا الزر لمشرفي القناة فقط.", show_alert=True)
+        return
+    item = ctx.bot_data.get("pending", {}).pop(q.data[4:], None)
+    if not item:
+        await q.answer("انتهت صلاحية الزر، أعد الأمر.", show_alert=True)
+        return
+    entry, text = item
+    s = _settings(ctx)
+    if jobs._already_posted(entry.link):
+        await q.answer("هذا الخبر نُشر سابقًا.", show_alert=True)
+        return
+    try:
+        await jobs._publish(ctx.bot, s, entry, text)
+        jobs._mark_posted(entry.link)
+        extras.remember(entry, text, extras.is_breaking(entry))
+    except Exception:
+        log.exception("Manual publish failed")
+        await q.answer("تعذّر النشر، تحقق من صلاحيات البوت في القناة.", show_alert=True)
+        return
+    await q.answer("✅ نُشر في القناة")
+    try:
+        await q.edit_message_reply_markup(reply_markup=_preview_markup(ctx, entry, text, False))
+    except Exception:
+        pass
+
+
+async def post_cmd(update: Update, ctx: Ctx) -> None:
+    """/post نص الخبر ← ينشره في القناة بالتوقيع (للمشرفين فقط)."""
+    msg = update.message
+    if not msg or not update.effective_user:
+        return
+    if not await _is_admin(ctx, update.effective_user.id):
+        await _reply(update, "هذا الأمر لمشرفي القناة فقط.")
+        return
+    parts = (msg.text or "").split(None, 1)
+    body = parts[1].strip() if len(parts) > 1 else ""
+    if not body:
+        await _reply(update, "اكتب الخبر بعد الأمر، مثال:\n/post 🏆 الوداد يفوز على الرجاء 2-1\n#نتائج")
+        return
+    s = _settings(ctx)
+    try:
+        await ctx.bot.send_message(
+            chat_id=s.channel_id, text=html.escape(body) + extras.signature(s),
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        )
+        await _reply(update, "✅ نُشر في القناة.")
+    except Exception:
+        log.exception("/post failed")
+        await _reply(update, "تعذّر النشر، تأكد أن البوت مشرف في القناة.")
+
+
+async def match_cmd(update: Update, ctx: Ctx) -> None:
+    """/match ثم سطر لكل مباراة ← ينشر أوقات المباريات في القناة (للمشرفين فقط)."""
+    msg = update.message
+    if not msg or not update.effective_user:
+        return
+    if not await _is_admin(ctx, update.effective_user.id):
+        await _reply(update, "هذا الأمر لمشرفي القناة فقط.")
+        return
+    parts = (msg.text or "").split(None, 1)
+    body = parts[1] if len(parts) > 1 else ""
+    text = fixtures.build_manual(body, datetime.now(fixtures.TZ))
+    if not text:
+        await _reply(
+            update,
+            "اكتب المباريات هكذا (سطر لكل مباراة):\n\n"
+            "/match\n🇲🇦 الدوري المغربي\nالوداد - الرجاء 20:00\n"
+            "الجيش الملكي - نهضة بركان 18:00\n\n"
+            "وللغد اجعل أول سطر: غداً",
+        )
+        return
+    s = _settings(ctx)
+    try:
+        await ctx.bot.send_message(
+            chat_id=s.channel_id, text=text + extras.signature(s),
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        )
+        await _reply(update, "✅ نُشرت المباريات في القناة.")
+    except Exception:
+        log.exception("/match failed")
+        await _reply(update, "تعذّر النشر، تأكد أن البوت مشرف في القناة.")
+
+
+async def _arab_news(update: Update, ctx: Ctx, only_morocco: bool) -> None:
+    """أحدث أخبار المغرب/الدوريات العربية من كل المصادر، تصلك أنت فقط."""
+    s = _settings(ctx)
+    writer: Writer = ctx.bot_data["writer"]
+    try:
+        entries = [e for e in await fetch_entries(s.news_feeds) if not is_womens(e)]
+        pick = extras.is_morocco if only_morocco else (lambda e: extras.is_morocco(e) or extras.is_arab(e))
+        entries = [e for e in entries if pick(e)][:8]
+        sent = 0
+        for entry in entries:
+            if sent >= 3:
+                break
+            text = await writer.rewrite(entry)
+            if not text:
+                continue
+            text = extras.decorate(text, entry, extras.is_breaking(entry))
+            if update.message:
+                await update.message.reply_text(
+                    html.escape(text) + extras.signature(s),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_preview_markup(ctx, entry, text),
+                    disable_web_page_preview=True,
+                )
+            sent += 1
+        if not sent:
+            await _reply(update, "لا توجد أخبار مطابقة الآن.")
+    except Exception:
+        log.exception("Arab news command failed")
+        await _reply(update, "تعذّر جلب الأخبار الآن، حاول بعد قليل.")
+
+
+async def morocco(update: Update, ctx: Ctx) -> None:
+    await _arab_news(update, ctx, True)
+
+
+async def arab(update: Update, ctx: Ctx) -> None:
+    await _arab_news(update, ctx, False)
 
 
 async def today(update: Update, ctx: Ctx) -> None:
@@ -208,6 +366,9 @@ async def start(update: Update, _ctx: Ctx) -> None:
         "/إصابات — أخبار الإصابات\n"
         "/انتقالات — أخبار الانتقالات\n"
         "/مباريات — مباريات اليوم\n"
+        "/morocco — أخبار المغرب\n/arab — أخبار الدوريات العربية\n"
+        "/post نص — نشر خبرك في القناة (للمشرفين)\n"
+        "/match — نشر أوقات مباريات تكتبها بنفسك (للمشرفين)\n"
         "/todayresults — نتائج اليوم\n/todayresults_demo — معاينة شكل النتائج\n\n"
         "الدوريات: PL, PD, SA, BL1, FL1",
     )
@@ -221,6 +382,10 @@ ARABIC_ROUTES = {
     "إصابات": injuries,
     "اصابات": injuries,
     "انتقالات": transfers,
+    "نشر": post_cmd,
+    "مباراة": match_cmd,
+    "مغرب": morocco,
+    "عربي": arab,
     "مباريات": today,
     "اليوم": today,
     "نتائج_اليوم": today_results,
@@ -266,6 +431,11 @@ async def _post_init(app: Application) -> None:  # type: ignore[type-arg]
     cron(summary.post_nightly_summary, "SUMMARY_TIME", "23:00")     # ملخص الليلة
     cron(fixtures.unpin_fixtures, "UNPIN_TIME", "23:55")            # إلغاء التثبيت
     cron(summary.post_weekly_scorers, "SCORERS_TIME", "12:00", day_of_week="mon")  # الهدافون
+    cron(summary.post_weekly_summary, "WEEKLY_TIME", "20:00", day_of_week="sun")  # ملخص الأسبوع
+    scheduler.add_job(
+        fixtures.post_match_reminders, "interval", minutes=15, args=args,
+        max_instances=1, coalesce=True,
+    )
     scheduler.start()
     app.bot_data["scheduler"] = scheduler
 
@@ -284,6 +454,11 @@ def main() -> None:
     app.add_handler(CommandHandler("injuries", injuries))
     app.add_handler(CommandHandler("transfers", transfers))
     app.add_handler(CommandHandler("today", today))
+    app.add_handler(CommandHandler("morocco", morocco))
+    app.add_handler(CommandHandler("arab", arab))
+    app.add_handler(CommandHandler("post", post_cmd))
+    app.add_handler(CommandHandler("match", match_cmd))
+    app.add_handler(CallbackQueryHandler(publish_cb, pattern=r"^pub:"))
     app.add_handler(CommandHandler("todayresults", today_results))
     app.add_handler(CommandHandler("test", test_cmd))
     # تيليغرام يعدّ الشرطة السفلية جزءًا من اسم الأمر، فندعم /test_api وأخواتها أيضًا
